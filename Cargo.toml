@@ -1,0 +1,29 @@
+[package]
+name = "flashinfer-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["vasia123"]
+license = "Apache-2.0"
+description = "Rust bindings for FlashInfer - high-performance attention kernels for LLM inference"
+repository = "https://github.com/vasia123/flashinfer-rs"
+keywords = ["llm", "attention", "cuda", "flashinfer", "inference"]
+categories = ["science", "mathematics", "external-ffi-bindings"]
+readme = "README.md"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+thiserror = "1.0"
+half = { version = "2.3", features = ["num-traits"] }
+
+# Optional CUDA support
+cudarc = { version = "0.12", optional = true }
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.69"
+
+[dev-dependencies]
+candle-core = "0.8"

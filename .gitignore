@@ -1,0 +1,19 @@
+/target
+Cargo.lock
+
+# Build artifacts
+*.so
+*.a
+*.o
+*.ptx
+*.cubin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
