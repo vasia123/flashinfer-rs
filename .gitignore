@@ -1,6 +1,9 @@
 /target
 Cargo.lock
 
+# Reference source (cloned for development)
+/references/
+
 # Build artifacts
 *.so
 *.a

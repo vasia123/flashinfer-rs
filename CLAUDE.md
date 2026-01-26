@@ -15,7 +15,17 @@ Rust bindings for FlashInfer — high-performance attention kernels for LLM infe
 
 FlashInfer source: https://github.com/flashinfer-ai/flashinfer
 
-Key directories to study:
+### Setup reference
+
+```bash
+cd ~/projects_hobby/flashinfer-rs
+if [ ! -d "references/flashinfer" ]; then
+    mkdir -p references
+    git clone --depth 1 https://github.com/flashinfer-ai/flashinfer.git references/flashinfer
+fi
+```
+
+### Key directories to study (in references/flashinfer/)
 - `include/flashinfer/` — C++ headers with kernel interfaces
 - `csrc/` — CUDA kernel implementations
 - `flashinfer/` — Python API (shows intended usage patterns)
