@@ -135,7 +135,7 @@ impl PageTableBuilder {
 
     /// Set maximum sequence length (will compute max_num_pages).
     pub fn max_seq_len(mut self, max_seq_len: usize) -> Self {
-        self.max_num_pages = (max_seq_len + self.page_size - 1) / self.page_size;
+        self.max_num_pages = max_seq_len.div_ceil(self.page_size);
         self
     }
 

@@ -9,10 +9,21 @@ repository = "https://github.com/vasia123/flashinfer-rs"
 keywords = ["llm", "attention", "cuda", "flashinfer", "inference"]
 categories = ["science", "mathematics", "external-ffi-bindings"]
 readme = "README.md"
+build = "build.rs"
 
 [features]
 default = []
+
+# Core CUDA support - enables GPU operations
 cuda = ["dep:cudarc"]
+
+# CUDA version selection (mutually exclusive)
+cuda-11 = ["cuda"]
+cuda-12 = ["cuda"]
+
+# GPU architecture targets (can combine multiple)
+sm80 = ["cuda"]  # Ampere (A100, RTX 30xx)
+sm90 = ["cuda"]  # Hopper (H100, H200)
 
 [dependencies]
 thiserror = "1.0"
@@ -22,8 +33,12 @@ half = { version = "2.3", features = ["num-traits"] }
 cudarc = { version = "0.12", optional = true }
 
 [build-dependencies]
-cc = "1.0"
+cc = { version = "1.0", features = ["parallel"] }
 bindgen = "0.69"
 
 [dev-dependencies]
 candle-core = "0.8"
+
+[package.metadata.docs.rs]
+# Build docs without CUDA for docs.rs
+no-default-features = true

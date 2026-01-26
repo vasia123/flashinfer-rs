@@ -1,64 +1,312 @@
 //! Build script for flashinfer-rs.
 //!
 //! This script handles:
-//! 1. Compiling FlashInfer CUDA kernels
-//! 2. Generating Rust FFI bindings via bindgen
+//! 1. Detecting CUDA toolkit and GPU architecture
+//! 2. Compiling FlashInfer CUDA kernels via cc/nvcc
+//! 3. Generating Rust FFI bindings via bindgen
 //!
-//! # Prerequisites
+//! # Environment Variables
 //!
-//! - CUDA toolkit (nvcc)
-//! - C++ compiler with C++17 support
-//! - FlashInfer source (place in `flashinfer/` or set FLASHINFER_PATH)
+//! - `CUDA_HOME` or `CUDA_PATH`: Path to CUDA toolkit
+//! - `FLASHINFER_PATH`: Path to FlashInfer source (default: `references/flashinfer`)
+//! - `FLASHINFER_CUDA_ARCH`: Target SM architecture (e.g., "80", "90")
+//!
+//! # Feature Flags
+//!
+//! - `cuda`: Enable CUDA support (required for GPU operations)
+//! - `cuda-11`: Target CUDA 11.x
+//! - `cuda-12`: Target CUDA 12.x (default when cuda feature enabled)
+//! - `sm80`: Target SM80 (Ampere)
+//! - `sm90`: Target SM90 (Hopper)
+
+use std::env;
+use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=csrc/");
-    println!("cargo:rerun-if-changed=flashinfer/");
 
-    // Check if we have CUDA
-    let cuda_available = std::env::var("CUDA_HOME").is_ok()
-        || std::env::var("CUDA_PATH").is_ok()
-        || std::path::Path::new("/usr/local/cuda").exists();
-
-    if !cuda_available {
-        println!("cargo:warning=CUDA not found, building without CUDA support");
+    // Check if CUDA feature is enabled
+    let cuda_enabled = env::var("CARGO_FEATURE_CUDA").is_ok();
+    if !cuda_enabled {
+        println!("cargo:warning=Building without CUDA support. Enable 'cuda' feature for GPU operations.");
         return;
     }
 
-    // Check if FlashInfer source is available
-    let flashinfer_path = std::env::var("FLASHINFER_PATH")
-        .unwrap_or_else(|_| "flashinfer".to_string());
+    // Find CUDA toolkit
+    let cuda_path = find_cuda_path();
+    let cuda_path = match cuda_path {
+        Some(path) => path,
+        None => {
+            println!("cargo:warning=CUDA toolkit not found. Set CUDA_HOME or CUDA_PATH environment variable.");
+            println!("cargo:warning=Building without CUDA kernel support.");
+            return;
+        }
+    };
 
-    if !std::path::Path::new(&flashinfer_path).exists() {
-        println!(
-            "cargo:warning=FlashInfer source not found at '{}'. \
-             Download from https://github.com/flashinfer-ai/flashinfer \
-             or set FLASHINFER_PATH environment variable.",
-            flashinfer_path
-        );
+    println!("cargo:warning=Found CUDA at: {}", cuda_path.display());
+
+    // Find FlashInfer source
+    let flashinfer_path = find_flashinfer_path();
+    let flashinfer_path = match flashinfer_path {
+        Some(path) => path,
+        None => {
+            println!(
+                "cargo:warning=FlashInfer source not found. Run: git clone --depth 1 \
+                 https://github.com/flashinfer-ai/flashinfer.git references/flashinfer"
+            );
+            println!("cargo:warning=Building without FlashInfer kernel support.");
+            // Still generate stub bindings for the C API
+            generate_stub_bindings();
+            return;
+        }
+    };
+
+    println!(
+        "cargo:warning=Found FlashInfer at: {}",
+        flashinfer_path.display()
+    );
+
+    // Determine target architecture
+    let cuda_arch = determine_cuda_arch();
+    println!("cargo:warning=Target CUDA architecture: SM{}", cuda_arch);
+
+    // Compile CUDA kernels
+    if let Err(e) = compile_cuda_kernels(&cuda_path, &flashinfer_path, cuda_arch) {
+        println!("cargo:warning=Failed to compile CUDA kernels: {}", e);
+        println!("cargo:warning=FFI functions will return UNSUPPORTED at runtime.");
+        generate_stub_bindings();
         return;
     }
 
-    // TODO: Implement actual kernel compilation
-    //
-    // Steps:
-    // 1. Use cc crate to compile C++ glue code
-    // 2. Use nvcc to compile CUDA kernels
-    // 3. Link everything together
-    // 4. Generate bindings with bindgen
-    //
-    // Example (pseudo-code):
-    //
-    // cc::Build::new()
-    //     .cuda(true)
-    //     .flag("-std=c++17")
-    //     .include(&flashinfer_path)
-    //     .include(format!("{}/include", flashinfer_path))
-    //     .file("csrc/flashinfer_ops.cu")
-    //     .compile("flashinfer_kernels");
-    //
-    // println!("cargo:rustc-link-lib=cudart");
-    // println!("cargo:rustc-link-lib=flashinfer_kernels");
+    // Generate Rust FFI bindings
+    generate_bindings(&cuda_path, &flashinfer_path);
 
-    println!("cargo:warning=FlashInfer CUDA kernels not yet compiled (TODO)");
+    // Link CUDA runtime
+    link_cuda(&cuda_path);
+}
+
+/// Find CUDA toolkit installation path
+fn find_cuda_path() -> Option<PathBuf> {
+    // Check environment variables
+    if let Ok(path) = env::var("CUDA_HOME") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(path) = env::var("CUDA_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Check common installation paths
+    let common_paths = [
+        "/usr/local/cuda",
+        "/usr/local/cuda-12",
+        "/usr/local/cuda-11",
+        "/opt/cuda",
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.0",
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
+    ];
+
+    for path in &common_paths {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// Find FlashInfer source directory
+fn find_flashinfer_path() -> Option<PathBuf> {
+    // Check environment variable
+    if let Ok(path) = env::var("FLASHINFER_PATH") {
+        let path = PathBuf::from(path);
+        if path.join("include/flashinfer").exists() {
+            return Some(path);
+        }
+    }
+
+    // Check default location
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let default_path = PathBuf::from(&manifest_dir).join("references/flashinfer");
+    if default_path.join("include/flashinfer").exists() {
+        return Some(default_path);
+    }
+
+    // Check alternative location
+    let alt_path = PathBuf::from(&manifest_dir).join("flashinfer");
+    if alt_path.join("include/flashinfer").exists() {
+        return Some(alt_path);
+    }
+
+    None
+}
+
+/// Determine target CUDA architecture
+fn determine_cuda_arch() -> u32 {
+    // Check environment variable
+    if let Ok(arch) = env::var("FLASHINFER_CUDA_ARCH") {
+        if let Ok(arch) = arch.parse::<u32>() {
+            return arch;
+        }
+    }
+
+    // Check feature flags
+    if env::var("CARGO_FEATURE_SM90").is_ok() {
+        return 90;
+    }
+    if env::var("CARGO_FEATURE_SM80").is_ok() {
+        return 80;
+    }
+
+    // Default to SM80 (Ampere) for broad compatibility
+    80
+}
+
+/// Compile CUDA kernels using cc crate
+fn compile_cuda_kernels(
+    cuda_path: &Path,
+    flashinfer_path: &Path,
+    cuda_arch: u32,
+) -> Result<(), String> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let csrc_path = PathBuf::from(&manifest_dir).join("csrc");
+
+    let c_api_cu = csrc_path.join("flashinfer_c_api.cu");
+    if !c_api_cu.exists() {
+        return Err(format!(
+            "CUDA source not found: {}",
+            c_api_cu.display()
+        ));
+    }
+
+    // Build with cc crate
+    let mut build = cc::Build::new();
+
+    build
+        .cuda(true)
+        .cudart("shared")
+        .cpp(true)
+        .std("c++17")
+        // Include paths
+        .include(&csrc_path)
+        .include(flashinfer_path.join("include"))
+        .include(cuda_path.join("include"))
+        // CUDA architecture
+        .flag(format!("-gencode=arch=compute_{},code=sm_{}", cuda_arch, cuda_arch))
+        // Optimization flags
+        .flag("-O3")
+        .flag("--expt-relaxed-constexpr")
+        .flag("--expt-extended-lambda")
+        // Suppress some warnings
+        .flag("-Wno-deprecated-gpu-targets")
+        // Source file
+        .file(&c_api_cu);
+
+    // Add debug flags in debug mode
+    if env::var("PROFILE").unwrap_or_default() == "debug" {
+        build.flag("-G").flag("-lineinfo");
+    }
+
+    build
+        .compile("flashinfer_kernels");
+
+    Ok(())
+}
+
+/// Generate Rust FFI bindings using bindgen
+fn generate_bindings(cuda_path: &Path, _flashinfer_path: &Path) {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let header_path = PathBuf::from(&manifest_dir).join("csrc/flashinfer_c_api.h");
+
+    let bindings = bindgen::Builder::default()
+        .header(header_path.to_str().unwrap())
+        .clang_arg(format!("-I{}", cuda_path.join("include").display()))
+        // Parse settings
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        // Generate settings
+        .derive_default(true)
+        .derive_debug(true)
+        .derive_copy(true)
+        .derive_eq(true)
+        .derive_hash(true)
+        // Allowlist our API
+        .allowlist_function("flashinfer_.*")
+        .allowlist_type("FlashInfer.*")
+        .allowlist_var("FLASHINFER_.*")
+        // Block system types we don't need
+        .blocklist_type("__.*")
+        .blocklist_type("cuda.*")
+        // Generate Rust-friendly enums
+        .rustified_enum("FlashInferStatus")
+        .rustified_enum("FlashInferDType")
+        .rustified_enum("FlashInferKVLayout")
+        .rustified_enum("FlashInferPosEncoding")
+        .generate()
+        .expect("Failed to generate FFI bindings");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    bindings
+        .write_to_file(out_path.join("ffi_generated.rs"))
+        .expect("Failed to write FFI bindings");
+}
+
+/// Generate stub bindings when FlashInfer is not available
+fn generate_stub_bindings() {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let header_path = PathBuf::from(&manifest_dir).join("csrc/flashinfer_c_api.h");
+
+    // Only generate if header exists
+    if !header_path.exists() {
+        println!("cargo:warning=C API header not found, skipping bindgen");
+        return;
+    }
+
+    let bindings = bindgen::Builder::default()
+        .header(header_path.to_str().unwrap())
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .derive_default(true)
+        .derive_debug(true)
+        .derive_copy(true)
+        .derive_eq(true)
+        .allowlist_function("flashinfer_.*")
+        .allowlist_type("FlashInfer.*")
+        .rustified_enum("FlashInferStatus")
+        .rustified_enum("FlashInferDType")
+        .rustified_enum("FlashInferKVLayout")
+        .rustified_enum("FlashInferPosEncoding")
+        .generate()
+        .expect("Failed to generate stub bindings");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    bindings
+        .write_to_file(out_path.join("ffi_generated.rs"))
+        .expect("Failed to write stub bindings");
+}
+
+/// Link CUDA runtime libraries
+fn link_cuda(cuda_path: &Path) {
+    // Add library search path
+    let lib_path = if cfg!(target_os = "windows") {
+        cuda_path.join("lib/x64")
+    } else {
+        cuda_path.join("lib64")
+    };
+
+    if lib_path.exists() {
+        println!("cargo:rustc-link-search=native={}", lib_path.display());
+    }
+
+    // Link CUDA runtime
+    println!("cargo:rustc-link-lib=cudart");
+
+    // Link our compiled kernels
+    println!("cargo:rustc-link-lib=static=flashinfer_kernels");
 }
