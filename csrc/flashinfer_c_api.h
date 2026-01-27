@@ -233,6 +233,7 @@ FlashInferStatus flashinfer_batch_decode_plan(
     FlashInferDType dtype,
     FlashInferPosEncoding pos_encoding,
     float logits_soft_cap,
+    int32_t window_left,  /* Sliding window size (-1 for full attention) */
     int enable_cuda_graph,
     void* stream
 );
@@ -343,6 +344,7 @@ FlashInferStatus flashinfer_batch_prefill_plan(
     FlashInferDType dtype,
     FlashInferPosEncoding pos_encoding,
     float logits_soft_cap,
+    int32_t window_left,  /* Sliding window size (-1 for full attention) */
     int causal,
     int enable_cuda_graph,
     void* stream

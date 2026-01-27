@@ -22,9 +22,25 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+/// CUDA source modules for incremental compilation.
+/// Split from monolithic flashinfer_c_api.cu for faster rebuilds.
+const CUDA_MODULES: &[&str] = &[
+    "flashinfer_decode.cu",   // Batch decode attention (8 variants) - slowest
+    "flashinfer_prefill.cu",  // Batch prefill attention (8 variants) - slowest
+    "flashinfer_norm.cu",     // RMSNorm, LayerNorm, etc.
+    "flashinfer_sampling.cu", // top_k, top_p, etc.
+    "flashinfer_rope.cu",     // Rotary position embedding
+    "flashinfer_page.cu",     // KV cache append
+    "flashinfer_utils.cu",    // Utilities (GPU info, workspace)
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=csrc/");
+    println!("cargo:rerun-if-changed=csrc/flashinfer_common.h");
+    println!("cargo:rerun-if-changed=csrc/flashinfer_c_api.h");
+    for module in CUDA_MODULES {
+        println!("cargo:rerun-if-changed=csrc/{}", module);
+    }
 
     // Check if CUDA feature is enabled
     let cuda_enabled = env::var("CARGO_FEATURE_CUDA").is_ok();
@@ -170,7 +186,11 @@ fn determine_cuda_arch() -> u32 {
     80
 }
 
-/// Compile CUDA kernels using cc crate
+/// Compile CUDA kernels using cc crate.
+///
+/// Each module is compiled as a separate object file, enabling:
+/// - Incremental builds: only changed modules recompile
+/// - Parallel compilation: independent modules build concurrently
 fn compile_cuda_kernels(
     cuda_path: &Path,
     flashinfer_path: &Path,
@@ -179,19 +199,27 @@ fn compile_cuda_kernels(
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let csrc_path = PathBuf::from(&manifest_dir).join("csrc");
 
-    let c_api_cu = csrc_path.join("flashinfer_c_api.cu");
-    if !c_api_cu.exists() {
+    // Verify common header exists
+    let common_header = csrc_path.join("flashinfer_common.h");
+    if !common_header.exists() {
         return Err(format!(
-            "CUDA source not found: {}",
-            c_api_cu.display()
+            "Common header not found: {}",
+            common_header.display()
         ));
+    }
+
+    // Collect source files
+    let mut source_files = Vec::new();
+    for module in CUDA_MODULES {
+        let source_path = csrc_path.join(module);
+        if !source_path.exists() {
+            return Err(format!("CUDA module not found: {}", source_path.display()));
+        }
+        source_files.push(source_path);
     }
 
     // Build with cc crate
     let mut build = cc::Build::new();
-
-    // Force-include compatibility header to work around nvcc/glibc incompatibility
-    let _compat_header = csrc_path.join("nvcc_compat.h");
 
     build
         .cuda(true)
@@ -206,23 +234,28 @@ fn compile_cuda_kernels(
         // NOTE: gcc-13 + glibc 2.39 is incompatible with nvcc 12.0
         .flag("-ccbin=g++-12")
         // CUDA architecture
-        .flag(format!("-gencode=arch=compute_{},code=sm_{}", cuda_arch, cuda_arch))
+        .flag(format!(
+            "-gencode=arch=compute_{},code=sm_{}",
+            cuda_arch, cuda_arch
+        ))
         // Optimization flags
         .flag("-O3")
         .flag("--expt-relaxed-constexpr")
         .flag("--expt-extended-lambda")
         // Suppress some warnings
-        .flag("-Wno-deprecated-gpu-targets")
-        // Source file
-        .file(&c_api_cu);
+        .flag("-Wno-deprecated-gpu-targets");
+
+    // Add all source files
+    for source in &source_files {
+        build.file(source);
+    }
 
     // Add debug flags in debug mode
     if env::var("PROFILE").unwrap_or_default() == "debug" {
         build.flag("-G").flag("-lineinfo");
     }
 
-    build
-        .compile("flashinfer_kernels");
+    build.compile("flashinfer_kernels");
 
     Ok(())
 }

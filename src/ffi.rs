@@ -351,6 +351,7 @@ impl BatchDecodePlan {
     /// * `dtype` - Data type
     /// * `pos_encoding` - Position encoding mode
     /// * `logits_soft_cap` - Soft cap for logits (0 to disable)
+    /// * `window_left` - Sliding window size (-1 for full attention)
     /// * `enable_cuda_graph` - Whether this will run in a CUDA graph
     /// * `stream` - CUDA stream (raw pointer)
     #[allow(clippy::too_many_arguments)]
@@ -370,6 +371,7 @@ impl BatchDecodePlan {
         dtype: DType,
         pos_encoding: PosEncoding,
         logits_soft_cap: f32,
+        window_left: i32,
         enable_cuda_graph: bool,
         stream: *mut std::ffi::c_void,
     ) -> Result<Self> {
@@ -392,6 +394,7 @@ impl BatchDecodePlan {
             dtype.into(),
             pos_encoding.into(),
             logits_soft_cap,
+            window_left,
             enable_cuda_graph as i32,
             stream,
         );
@@ -451,6 +454,9 @@ pub struct BatchPrefillPlan {
 
 impl BatchPrefillPlan {
     /// Create a new batch prefill plan.
+    ///
+    /// # Arguments
+    /// * `window_left` - Sliding window size (-1 for full attention)
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         float_workspace: *mut std::ffi::c_void,
@@ -469,6 +475,7 @@ impl BatchPrefillPlan {
         dtype: DType,
         pos_encoding: PosEncoding,
         logits_soft_cap: f32,
+        window_left: i32,
         causal: bool,
         enable_cuda_graph: bool,
         stream: *mut std::ffi::c_void,
@@ -493,6 +500,7 @@ impl BatchPrefillPlan {
             dtype.into(),
             pos_encoding.into(),
             logits_soft_cap,
+            window_left,
             causal as i32,
             enable_cuda_graph as i32,
             stream,

@@ -108,6 +108,51 @@ impl PageTable {
         let count = self.seq_page_counts[seq_idx];
         &self.data[start..start + count]
     }
+
+    /// Convert to FFI format: kv_indptr (cumulative page counts).
+    ///
+    /// Returns array of shape `[batch_size + 1]` where `kv_indptr[i]`
+    /// is the cumulative sum of pages for sequences `0..i`.
+    pub fn to_kv_indptr(&self) -> Vec<i32> {
+        let mut indptr = Vec::with_capacity(self.batch_size + 1);
+        indptr.push(0);
+        let mut cumsum = 0i32;
+        for &count in &self.seq_page_counts {
+            cumsum += count as i32;
+            indptr.push(cumsum);
+        }
+        indptr
+    }
+
+    /// Convert to FFI format: kv_indices (flattened block IDs).
+    ///
+    /// Returns all valid block IDs concatenated across sequences.
+    pub fn to_kv_indices(&self) -> Vec<i32> {
+        let total_pages: usize = self.seq_page_counts.iter().sum();
+        let mut indices = Vec::with_capacity(total_pages);
+        for seq_idx in 0..self.batch_size {
+            let blocks = self.seq_blocks(seq_idx);
+            indices.extend_from_slice(blocks);
+        }
+        indices
+    }
+
+    /// Compute kv_last_page_len from sequence lengths and page size.
+    ///
+    /// `kv_last_page_len[i]` = number of valid tokens in the last page of sequence `i`.
+    /// This equals `(kv_len[i] - 1) % page_size + 1` for non-empty sequences.
+    pub fn compute_kv_last_page_len(&self, kv_lengths: &[usize], page_size: usize) -> Vec<i32> {
+        kv_lengths
+            .iter()
+            .map(|&len| {
+                if len == 0 {
+                    0
+                } else {
+                    ((len - 1) % page_size + 1) as i32
+                }
+            })
+            .collect()
+    }
 }
 
 /// Builder for constructing page tables from sequence metadata.

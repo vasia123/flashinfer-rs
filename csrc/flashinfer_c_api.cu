@@ -105,6 +105,8 @@ struct BatchDecodePlan {
     bool enable_cuda_graph;
     float sm_scale;
     int32_t window_left;
+    float* alibi_slopes;      // GPU-allocated ALiBi slopes [num_qo_heads], nullptr if not using ALiBi
+    bool owns_alibi_slopes;   // Whether we should free alibi_slopes on destroy
 };
 
 struct BatchPrefillPlan {
@@ -126,7 +128,41 @@ struct BatchPrefillPlan {
     float sm_scale;
     int32_t window_left;
     uint32_t total_num_rows;  // Sum of all query lengths
+    float* alibi_slopes;      // GPU-allocated ALiBi slopes [num_qo_heads], nullptr if not using ALiBi
+    bool owns_alibi_slopes;   // Whether we should free alibi_slopes on destroy
 };
+
+// Compute ALiBi slopes for a given number of heads
+// Formula: slope[i] = 2^(-8 * (i + 1) / n) where n = num_heads
+// This follows the original ALiBi paper: https://arxiv.org/abs/2108.12409
+cudaError_t compute_alibi_slopes(float** d_slopes, uint32_t num_heads, cudaStream_t stream) {
+    // Allocate host memory for slopes
+    std::vector<float> h_slopes(num_heads);
+
+    // Compute slopes: ratio = 2^(-8/n), slope[i] = ratio^(i+1)
+    float ratio = std::pow(2.0f, -8.0f / static_cast<float>(num_heads));
+    for (uint32_t i = 0; i < num_heads; ++i) {
+        h_slopes[i] = std::pow(ratio, static_cast<float>(i + 1));
+    }
+
+    // Allocate device memory
+    float* slopes = nullptr;
+    cudaError_t err = cudaMalloc(&slopes, num_heads * sizeof(float));
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    // Copy to device
+    err = cudaMemcpyAsync(slopes, h_slopes.data(), num_heads * sizeof(float),
+                          cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        cudaFree(slopes);
+        return err;
+    }
+
+    *d_slopes = slopes;
+    return cudaSuccess;
+}
 
 // Convert our enums to FlashInfer enums
 flashinfer::QKVLayout to_qkv_layout(FlashInferKVLayout layout) {
@@ -343,6 +379,33 @@ namespace {
 // Standard attention variant: no custom mask, no sliding window, no soft cap, no alibi
 using StandardAttentionVariant = flashinfer::DefaultAttention<false, false, false, false>;
 
+// Sliding window attention variant: no custom mask, WITH sliding window, no soft cap, no alibi
+// Used when window_left >= 0 for models like Mistral
+using SlidingWindowAttentionVariant = flashinfer::DefaultAttention<false, true, false, false>;
+
+// Soft cap attention variant: no custom mask, no sliding window, WITH soft cap, no alibi
+// Used when logits_soft_cap > 0 for models like Gemma 2
+using SoftCapAttentionVariant = flashinfer::DefaultAttention<false, false, true, false>;
+
+// Combined sliding window + soft cap variant
+// Used when both window_left >= 0 AND logits_soft_cap > 0
+using SlidingWindowSoftCapAttentionVariant = flashinfer::DefaultAttention<false, true, true, false>;
+
+// ALiBi attention variants: use_alibi = true
+// ALiBi (Attention with Linear Biases) is used by models like BLOOM and MPT
+
+// ALiBi only
+using ALiBiAttentionVariant = flashinfer::DefaultAttention<false, false, false, true>;
+
+// ALiBi + sliding window
+using ALiBiSlidingWindowAttentionVariant = flashinfer::DefaultAttention<false, true, false, true>;
+
+// ALiBi + soft cap
+using ALiBiSoftCapAttentionVariant = flashinfer::DefaultAttention<false, false, true, true>;
+
+// ALiBi + sliding window + soft cap (all features)
+using ALiBiSlidingWindowSoftCapAttentionVariant = flashinfer::DefaultAttention<false, true, true, true>;
+
 // Template helper to call DecodePlan with the right parameters
 template <typename DType, uint32_t HEAD_DIM>
 cudaError_t call_decode_plan(
@@ -384,8 +447,9 @@ cudaError_t call_decode_plan(
 }
 
 // Template helper to call BatchDecodeWithPagedKVCacheDispatched
-template <typename DType, uint32_t HEAD_DIM>
-cudaError_t call_batch_decode_run(
+// AttentionVariant is a template parameter to support both standard and sliding window attention
+template <typename DType, uint32_t HEAD_DIM, typename AttentionVariant>
+cudaError_t call_batch_decode_run_impl(
     const BatchDecodePlan* plan,
     const void* q,
     const void* k_cache,
@@ -399,7 +463,6 @@ cudaError_t call_batch_decode_run(
     cudaStream_t stream
 ) {
     using Params = flashinfer::BatchDecodeParams<DType, DType, DType, int32_t>;
-    using AttentionVariant = StandardAttentionVariant;
     constexpr flashinfer::PosEncodingMode POS_ENCODING_MODE = flashinfer::PosEncodingMode::kNone;
 
     // Create paged_kv structure (contiguous layout version)
@@ -425,7 +488,7 @@ cudaError_t call_batch_decode_run(
     params.paged_kv = paged_kv;
     params.o = static_cast<DType*>(output);
     params.lse = lse;
-    params.maybe_alibi_slopes = nullptr;  // No ALiBi
+    params.maybe_alibi_slopes = plan->alibi_slopes;  // ALiBi slopes (nullptr if not using ALiBi)
     params.padded_batch_size = plan->plan_info.padded_batch_size;
     params.num_qo_heads = plan->num_qo_heads;
     params.q_stride_n = plan->num_qo_heads * HEAD_DIM;  // Contiguous layout
@@ -468,9 +531,74 @@ cudaError_t call_batch_decode_run(
         params, tmp_v, tmp_s, false /* enable_pdl */, stream);
 }
 
+// Wrapper that dispatches to the correct attention variant based on window_left, logits_soft_cap, and ALiBi
+template <typename DType, uint32_t HEAD_DIM>
+cudaError_t call_batch_decode_run(
+    const BatchDecodePlan* plan,
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* kv_indptr,
+    const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    void* output,
+    float* lse,
+    flashinfer::QKVLayout kv_layout,
+    cudaStream_t stream
+) {
+    // Dispatch based on window_left, logits_soft_cap, and ALiBi
+    // window_left: -1 means full attention, >= 0 means sliding window
+    // logits_soft_cap: 0.0 means no soft cap, > 0.0 means apply soft cap (Gemma 2)
+    // alibi_slopes: nullptr means no ALiBi, non-null means use ALiBi (BLOOM, MPT)
+    const bool use_sliding_window = (plan->window_left >= 0);
+    const bool use_soft_cap = (plan->logits_soft_cap > 0.0f);
+    const bool use_alibi = (plan->alibi_slopes != nullptr);
+
+    // Dispatch to appropriate variant based on feature combination
+    // 8 combinations: 2^3 (sliding_window × soft_cap × alibi)
+    if (use_alibi) {
+        if (use_sliding_window && use_soft_cap) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, ALiBiSlidingWindowSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_sliding_window) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, ALiBiSlidingWindowAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_soft_cap) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, ALiBiSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, ALiBiAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        }
+    } else {
+        if (use_sliding_window && use_soft_cap) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, SlidingWindowSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_sliding_window) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, SlidingWindowAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_soft_cap) {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, SoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else {
+            return call_batch_decode_run_impl<DType, HEAD_DIM, StandardAttentionVariant>(
+                plan, q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        }
+    }
+}
+
 // Template helper to call BatchPrefillWithPagedKVCacheDispatched
-template <typename DType, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
-cudaError_t call_batch_prefill_run(
+// AttentionVariant is a template parameter to support both standard and sliding window attention
+template <typename DType, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE, typename AttentionVariant>
+cudaError_t call_batch_prefill_run_impl(
     const BatchPrefillPlan* plan,
     const void* q,
     const void* k_cache,
@@ -485,7 +613,6 @@ cudaError_t call_batch_prefill_run(
     cudaStream_t stream
 ) {
     using Params = flashinfer::BatchPrefillPagedParams<DType, DType, DType, int32_t>;
-    using AttentionVariant = StandardAttentionVariant;
     constexpr flashinfer::PosEncodingMode POS_ENCODING_MODE = flashinfer::PosEncodingMode::kNone;
     constexpr bool USE_FP16_QK_REDUCTION = false;
     constexpr uint32_t CTA_TILE_Q = 64;  // Default CTA tile size
@@ -514,7 +641,7 @@ cudaError_t call_batch_prefill_run(
     params.maybe_q_rope_offset = nullptr;  // No RoPE
     params.o = static_cast<DType*>(output);
     params.lse = lse;
-    params.maybe_alibi_slopes = nullptr;  // No ALiBi
+    params.maybe_alibi_slopes = plan->alibi_slopes;  // ALiBi slopes (nullptr if not using ALiBi)
     params.group_size = flashinfer::uint_fastdiv(plan->num_qo_heads / plan->num_kv_heads);
     params.num_qo_heads = plan->num_qo_heads;
     params.q_stride_n = plan->num_qo_heads * HEAD_DIM;  // Contiguous layout
@@ -567,6 +694,71 @@ cudaError_t call_batch_prefill_run(
         params, tmp_v, tmp_s, false /* enable_pdl */, stream);
 }
 
+// Wrapper that dispatches to the correct attention variant based on window_left, logits_soft_cap, and ALiBi
+template <typename DType, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
+cudaError_t call_batch_prefill_run(
+    const BatchPrefillPlan* plan,
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_indptr,
+    const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    void* output,
+    float* lse,
+    flashinfer::QKVLayout kv_layout,
+    cudaStream_t stream
+) {
+    // Dispatch based on window_left, logits_soft_cap, and ALiBi
+    // window_left: -1 means full attention, >= 0 means sliding window
+    // logits_soft_cap: 0.0 means no soft cap, > 0.0 means apply soft cap (Gemma 2)
+    // alibi_slopes: nullptr means no ALiBi, non-null means use ALiBi (BLOOM, MPT)
+    const bool use_sliding_window = (plan->window_left >= 0);
+    const bool use_soft_cap = (plan->logits_soft_cap > 0.0f);
+    const bool use_alibi = (plan->alibi_slopes != nullptr);
+
+    // Dispatch to appropriate variant based on feature combination
+    // 8 combinations: 2^3 (sliding_window × soft_cap × alibi)
+    if (use_alibi) {
+        if (use_sliding_window && use_soft_cap) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, ALiBiSlidingWindowSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_sliding_window) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, ALiBiSlidingWindowAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_soft_cap) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, ALiBiSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, ALiBiAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        }
+    } else {
+        if (use_sliding_window && use_soft_cap) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, SlidingWindowSoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_sliding_window) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, SlidingWindowAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else if (use_soft_cap) {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, SoftCapAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        } else {
+            return call_batch_prefill_run_impl<DType, HEAD_DIM, MASK_MODE, StandardAttentionVariant>(
+                plan, q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                output, lse, kv_layout, stream);
+        }
+    }
+}
+
 }  // namespace (template helpers)
 
 extern "C" {
@@ -588,6 +780,7 @@ FlashInferStatus flashinfer_batch_decode_plan(
     FlashInferDType dtype,
     FlashInferPosEncoding pos_encoding,
     float logits_soft_cap,
+    int32_t window_left,
     int enable_cuda_graph,
     void* stream
 ) {
@@ -605,11 +798,14 @@ FlashInferStatus flashinfer_batch_decode_plan(
         return FLASHINFER_INVALID_ARGUMENT;
     }
 
-    // Only support PosEncodingMode::kNone for now
-    if (pos_encoding != FLASHINFER_POS_ENCODING_NONE) {
-        set_error("Only FLASHINFER_POS_ENCODING_NONE is supported currently");
+    // Check for unsupported position encoding modes (RoPE modes not yet implemented in this API)
+    if (pos_encoding == FLASHINFER_POS_ENCODING_ROPE_LLAMA ||
+        pos_encoding == FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE) {
+        set_error("RoPE position encoding is not yet supported. Use FLASHINFER_POS_ENCODING_NONE or FLASHINFER_POS_ENCODING_ALIBI");
         return FLASHINFER_UNSUPPORTED;
     }
+
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
     BatchDecodePlan* plan = new BatchDecodePlan();
     plan->batch_size = batch_size;
@@ -626,9 +822,19 @@ FlashInferStatus flashinfer_batch_decode_plan(
     plan->int_workspace_size = int_workspace_size;
     plan->enable_cuda_graph = (enable_cuda_graph != 0);
     plan->sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    plan->window_left = -1;  // No sliding window
+    plan->window_left = window_left;  // Sliding window size (-1 = full attention)
+    plan->alibi_slopes = nullptr;
+    plan->owns_alibi_slopes = false;
 
-    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    // Compute ALiBi slopes if using ALiBi position encoding
+    if (pos_encoding == FLASHINFER_POS_ENCODING_ALIBI) {
+        cudaError_t alibi_err = compute_alibi_slopes(&plan->alibi_slopes, num_qo_heads, cuda_stream);
+        if (alibi_err != cudaSuccess) {
+            delete plan;
+            return from_cuda_error(alibi_err);
+        }
+        plan->owns_alibi_slopes = true;
+    }
     cudaError_t err = cudaSuccess;
 
     // Dispatch based on dtype and head_dim
@@ -694,6 +900,10 @@ FlashInferStatus flashinfer_batch_decode_plan_destroy(
 ) {
     if (plan_handle) {
         BatchDecodePlan* plan = reinterpret_cast<BatchDecodePlan*>(plan_handle);
+        // Free ALiBi slopes if we allocated them
+        if (plan->alibi_slopes && plan->owns_alibi_slopes) {
+            cudaFree(plan->alibi_slopes);
+        }
         delete plan;
     }
     return FLASHINFER_SUCCESS;
@@ -717,6 +927,7 @@ FlashInferStatus flashinfer_batch_prefill_plan(
     FlashInferDType dtype,
     FlashInferPosEncoding pos_encoding,
     float logits_soft_cap,
+    int32_t window_left,
     int causal,
     int enable_cuda_graph,
     void* stream
@@ -736,15 +947,18 @@ FlashInferStatus flashinfer_batch_prefill_plan(
         return FLASHINFER_INVALID_ARGUMENT;
     }
 
-    // Only support PosEncodingMode::kNone for now
-    if (pos_encoding != FLASHINFER_POS_ENCODING_NONE) {
-        set_error("Only FLASHINFER_POS_ENCODING_NONE is supported currently");
+    // Check for unsupported position encoding modes (RoPE modes not yet implemented in this API)
+    if (pos_encoding == FLASHINFER_POS_ENCODING_ROPE_LLAMA ||
+        pos_encoding == FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE) {
+        set_error("RoPE position encoding is not yet supported. Use FLASHINFER_POS_ENCODING_NONE or FLASHINFER_POS_ENCODING_ALIBI");
         return FLASHINFER_UNSUPPORTED;
     }
 
     // Calculate total_num_rows from qo_indptr (sum of all query lengths)
     // qo_indptr is assumed to be on host memory for planning
     uint32_t total_num_rows = qo_indptr[batch_size] - qo_indptr[0];
+
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
     BatchPrefillPlan* plan = new BatchPrefillPlan();
     plan->batch_size = batch_size;
@@ -762,10 +976,20 @@ FlashInferStatus flashinfer_batch_prefill_plan(
     plan->int_workspace_size = int_workspace_size;
     plan->enable_cuda_graph = (enable_cuda_graph != 0);
     plan->sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    plan->window_left = -1;  // No sliding window
+    plan->window_left = window_left;  // Sliding window size (-1 = full attention)
     plan->total_num_rows = total_num_rows;
+    plan->alibi_slopes = nullptr;
+    plan->owns_alibi_slopes = false;
 
-    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    // Compute ALiBi slopes if using ALiBi position encoding
+    if (pos_encoding == FLASHINFER_POS_ENCODING_ALIBI) {
+        cudaError_t alibi_err = compute_alibi_slopes(&plan->alibi_slopes, num_qo_heads, cuda_stream);
+        if (alibi_err != cudaSuccess) {
+            delete plan;
+            return from_cuda_error(alibi_err);
+        }
+        plan->owns_alibi_slopes = true;
+    }
 
     // Call PrefillPlan to compute workspace layout
     cudaError_t err = flashinfer::PrefillPlan<int32_t>(
@@ -855,6 +1079,10 @@ FlashInferStatus flashinfer_batch_prefill_plan_destroy(
 ) {
     if (plan_handle) {
         BatchPrefillPlan* plan = reinterpret_cast<BatchPrefillPlan*>(plan_handle);
+        // Free ALiBi slopes if we allocated them
+        if (plan->alibi_slopes && plan->owns_alibi_slopes) {
+            cudaFree(plan->alibi_slopes);
+        }
         delete plan;
     }
     return FLASHINFER_SUCCESS;
