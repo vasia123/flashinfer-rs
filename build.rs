@@ -190,6 +190,9 @@ fn compile_cuda_kernels(
     // Build with cc crate
     let mut build = cc::Build::new();
 
+    // Force-include compatibility header to work around nvcc/glibc incompatibility
+    let _compat_header = csrc_path.join("nvcc_compat.h");
+
     build
         .cuda(true)
         .cudart("shared")
@@ -199,6 +202,9 @@ fn compile_cuda_kernels(
         .include(&csrc_path)
         .include(flashinfer_path.join("include"))
         .include(cuda_path.join("include"))
+        // Use gcc-12 as host compiler for compatibility with nvcc 12.0
+        // NOTE: gcc-13 + glibc 2.39 is incompatible with nvcc 12.0
+        .flag("-ccbin=g++-12")
         // CUDA architecture
         .flag(format!("-gencode=arch=compute_{},code=sm_{}", cuda_arch, cuda_arch))
         // Optimization flags
@@ -304,9 +310,13 @@ fn link_cuda(cuda_path: &Path) {
         println!("cargo:rustc-link-search=native={}", lib_path.display());
     }
 
-    // Link CUDA runtime
+    // Link our compiled kernels first (static library)
+    // NOTE: Order matters! Static libraries must come before the libraries they depend on.
+    println!("cargo:rustc-link-lib=static=flashinfer_kernels");
+
+    // Link CUDA runtime (provides __cudaLaunchKernel, __cudaPopCallConfiguration, etc.)
     println!("cargo:rustc-link-lib=cudart");
 
-    // Link our compiled kernels
-    println!("cargo:rustc-link-lib=static=flashinfer_kernels");
+    // Link C++ standard library (provides __cxa_guard_acquire, etc.)
+    println!("cargo:rustc-link-lib=stdc++");
 }

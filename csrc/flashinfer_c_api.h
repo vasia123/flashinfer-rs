@@ -31,6 +31,7 @@ typedef enum {
     FLASHINFER_OUT_OF_MEMORY = 3,
     FLASHINFER_UNSUPPORTED = 4,
     FLASHINFER_INTERNAL_ERROR = 5,
+    FLASHINFER_NOT_INITIALIZED = 6,
 } FlashInferStatus;
 
 /* ============================================================================
@@ -57,7 +58,23 @@ typedef enum {
     FLASHINFER_POS_ENCODING_NONE = 0,
     FLASHINFER_POS_ENCODING_ROPE_LLAMA = 1,
     FLASHINFER_POS_ENCODING_ALIBI = 2,
+    FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE = 3,
 } FlashInferPosEncoding;
+
+/* Attention mask mode */
+typedef enum {
+    FLASHINFER_MASK_NONE = 0,
+    FLASHINFER_MASK_CAUSAL = 1,
+    FLASHINFER_MASK_CUSTOM = 2,
+} FlashInferMaskMode;
+
+/* Attention backend selection */
+typedef enum {
+    FLASHINFER_BACKEND_AUTO = 0,
+    FLASHINFER_BACKEND_FA2 = 1,      /* FlashAttention-2 */
+    FLASHINFER_BACKEND_FA3 = 2,      /* FlashAttention-3 (SM90+) */
+    FLASHINFER_BACKEND_CUDNN = 3,    /* cuDNN */
+} FlashInferBackend;
 
 /* ============================================================================
  * Opaque handles
@@ -68,6 +85,50 @@ typedef struct FlashInferBatchDecodePlan* FlashInferBatchDecodePlanHandle;
 
 /* Opaque handle for batch prefill plan */
 typedef struct FlashInferBatchPrefillPlan* FlashInferBatchPrefillPlanHandle;
+
+/* ============================================================================
+ * Configuration structures
+ * ============================================================================ */
+
+/**
+ * Attention configuration for batch operations.
+ */
+typedef struct {
+    uint32_t num_qo_heads;           /* Number of query/output heads */
+    uint32_t num_kv_heads;           /* Number of key/value heads (< num_qo_heads for GQA) */
+    uint32_t head_dim_qk;            /* Head dimension for Q and K */
+    uint32_t head_dim_vo;            /* Head dimension for V and O (can differ for MLA) */
+
+    FlashInferPosEncoding pos_encoding_mode;
+    FlashInferMaskMode mask_mode;
+    FlashInferBackend backend;
+
+    float sm_scale;                  /* 1/sqrt(head_dim) by default, 0 for auto */
+    float rope_scale;                /* RoPE scale factor */
+    float rope_theta;                /* RoPE theta parameter */
+    float logits_soft_cap;           /* Soft cap for attention logits (0 to disable) */
+    int32_t window_left;             /* Sliding window size (-1 for full attention) */
+
+    int use_fp16_qk_reduction;       /* Use FP16 for QK reduction */
+    int return_lse;                  /* Return log-sum-exp values */
+} FlashInferAttentionConfig;
+
+/**
+ * RoPE configuration.
+ */
+typedef struct {
+    uint32_t rotary_dim;             /* Dimension to apply RoPE to */
+    int interleave;                  /* Use interleaved RoPE format */
+    float scale;                     /* RoPE scale factor */
+    float theta;                     /* RoPE theta parameter */
+} FlashInferRoPEConfig;
+
+/**
+ * Sampling configuration.
+ */
+typedef struct {
+    int deterministic;               /* Use deterministic sampling */
+} FlashInferSamplingConfig;
 
 /* ============================================================================
  * Workspace size queries
@@ -110,6 +171,19 @@ FlashInferStatus flashinfer_batch_prefill_workspace_size(
     int32_t head_dim,
     int32_t page_size,
     int32_t max_seq_len
+);
+
+/**
+ * Get required workspace size for general operations.
+ */
+FlashInferStatus flashinfer_get_workspace_size(
+    size_t* float_workspace_size,
+    size_t* int_workspace_size,
+    uint32_t batch_size,
+    uint32_t max_seq_len,
+    uint32_t num_heads,
+    uint32_t head_dim,
+    uint32_t page_size
 );
 
 /* ============================================================================
@@ -191,6 +265,26 @@ FlashInferStatus flashinfer_batch_decode_run(
     const int32_t* kv_last_page_len,
     void* output,
     float* lse,
+    FlashInferKVLayout kv_layout,
+    void* stream
+);
+
+/**
+ * Execute batch decode with FP8 scaling.
+ */
+FlashInferStatus flashinfer_batch_decode_run_fp8(
+    FlashInferBatchDecodePlanHandle plan_handle,
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* kv_indptr,
+    const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    void* output,
+    float* lse,
+    float q_scale,
+    float k_scale,
+    float v_scale,
     FlashInferKVLayout kv_layout,
     void* stream
 );
@@ -294,6 +388,82 @@ FlashInferStatus flashinfer_batch_prefill_plan_destroy(
 );
 
 /* ============================================================================
+ * Single Request Attention API
+ * ============================================================================ */
+
+/**
+ * Single decode attention (no batching overhead).
+ *
+ * @param q           Query tensor [num_qo_heads, head_dim]
+ * @param k           Key tensor [seq_len, num_kv_heads, head_dim]
+ * @param v           Value tensor [seq_len, num_kv_heads, head_dim]
+ * @param output      Output tensor [num_qo_heads, head_dim]
+ * @param lse         Optional log-sum-exp [num_qo_heads] (NULL to skip)
+ * @param num_qo_heads Number of query/output heads
+ * @param num_kv_heads Number of key/value heads
+ * @param head_dim    Head dimension
+ * @param seq_len     Sequence length
+ * @param dtype       Data type
+ * @param pos_encoding Position encoding mode
+ * @param sm_scale    Softmax scale (0 for auto)
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_single_decode(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* output,
+    float* lse,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t seq_len,
+    FlashInferDType dtype,
+    FlashInferPosEncoding pos_encoding,
+    float sm_scale,
+    void* stream
+);
+
+/**
+ * Single prefill attention (no batching overhead).
+ *
+ * @param q           Query tensor [qo_len, num_qo_heads, head_dim]
+ * @param k           Key tensor [kv_len, num_kv_heads, head_dim]
+ * @param v           Value tensor [kv_len, num_kv_heads, head_dim]
+ * @param output      Output tensor [qo_len, num_qo_heads, head_dim]
+ * @param lse         Optional log-sum-exp [qo_len, num_qo_heads] (NULL to skip)
+ * @param num_qo_heads Number of query/output heads
+ * @param num_kv_heads Number of key/value heads
+ * @param head_dim    Head dimension
+ * @param qo_len      Query sequence length
+ * @param kv_len      Key/Value sequence length
+ * @param dtype       Data type
+ * @param pos_encoding Position encoding mode
+ * @param causal      Apply causal masking
+ * @param sm_scale    Softmax scale (0 for auto)
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_single_prefill(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* output,
+    float* lse,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t qo_len,
+    int32_t kv_len,
+    FlashInferDType dtype,
+    FlashInferPosEncoding pos_encoding,
+    int causal,
+    float sm_scale,
+    void* stream
+);
+
+/* ============================================================================
  * Append KV Cache API
  * ============================================================================ */
 
@@ -337,6 +507,566 @@ FlashInferStatus flashinfer_append_paged_kv_cache(
     void* stream
 );
 
+/**
+ * Compute batch indices and positions from indptr for appending.
+ *
+ * @param append_indptr    Token offsets [batch_size + 1]
+ * @param seq_lens         Sequence lengths before append [batch_size]
+ * @param batch_indices    Output batch indices [total_tokens]
+ * @param positions        Output position indices [total_tokens]
+ * @param batch_size       Number of sequences
+ * @param total_tokens     Total number of tokens
+ * @param stream           CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_get_batch_indices_positions(
+    const int32_t* append_indptr,
+    const int32_t* seq_lens,
+    int32_t* batch_indices,
+    int32_t* positions,
+    uint32_t batch_size,
+    uint32_t total_tokens,
+    void* stream
+);
+
+/* ============================================================================
+ * Normalization API
+ * ============================================================================ */
+
+/**
+ * RMSNorm operation.
+ *
+ * output = input / sqrt(mean(input^2) + eps) * weight
+ *
+ * @param input       Input tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param output      Output tensor [batch_size, hidden_dim]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon for numerical stability
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_rmsnorm(
+    const void* input,
+    const void* weight,
+    void* output,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * RMSNorm with quantized FP8 output.
+ *
+ * @param input       Input tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param output      Output tensor [batch_size, hidden_dim] in FP8
+ * @param scale       Output scale tensor [1] or [batch_size]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon
+ * @param input_dtype Input data type
+ * @param output_dtype Output data type (FP8)
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_rmsnorm_quant(
+    const void* input,
+    const void* weight,
+    void* output,
+    float* scale,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType input_dtype,
+    FlashInferDType output_dtype,
+    void* stream
+);
+
+/**
+ * Fused residual add + RMSNorm.
+ *
+ * input += residual
+ * output = rmsnorm(input)
+ *
+ * @param input       Input tensor [batch_size, hidden_dim] (modified in-place)
+ * @param residual    Residual tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param output      Output tensor [batch_size, hidden_dim]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_fused_add_rmsnorm(
+    void* input,
+    const void* residual,
+    const void* weight,
+    void* output,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * LayerNorm operation.
+ *
+ * @param input       Input tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param bias        Bias tensor [hidden_dim] (can be NULL)
+ * @param output      Output tensor [batch_size, hidden_dim]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_layernorm(
+    const void* input,
+    const void* weight,
+    const void* bias,
+    void* output,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * QK RMSNorm for attention heads.
+ *
+ * Applies RMSNorm independently to each attention head. Used in some
+ * architectures that normalize Q and K before attention computation.
+ *
+ * @param input       Input tensor [batch_size, num_heads, head_dim]
+ * @param weight      Weight tensor [head_dim]
+ * @param output      Output tensor [batch_size, num_heads, head_dim]
+ * @param batch_size  Batch size (number of tokens)
+ * @param num_heads   Number of attention heads
+ * @param head_dim    Head dimension
+ * @param eps         Epsilon for numerical stability
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_qk_rmsnorm(
+    const void* input,
+    const void* weight,
+    void* output,
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t head_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Gemma-style RMSNorm.
+ *
+ * Similar to RMSNorm but adds 1.0 to the weight before applying.
+ * This matches the Gemma model's normalization implementation:
+ *   output = x * rsqrt(mean(x^2) + eps) * (weight + 1)
+ *
+ * @param input       Input tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param output      Output tensor [batch_size, hidden_dim]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon for numerical stability
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_gemma_rmsnorm(
+    const void* input,
+    const void* weight,
+    void* output,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Gemma-style fused residual add + RMSNorm.
+ *
+ * Combines residual addition with Gemma RMSNorm:
+ *   input += residual
+ *   output = GemmaRMSNorm(input)
+ *
+ * @param input       Input tensor [batch_size, hidden_dim] (modified in-place)
+ * @param residual    Residual tensor [batch_size, hidden_dim]
+ * @param weight      Weight tensor [hidden_dim]
+ * @param output      Output tensor [batch_size, hidden_dim]
+ * @param batch_size  Batch size
+ * @param hidden_dim  Hidden dimension
+ * @param eps         Epsilon
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_gemma_fused_add_rmsnorm(
+    void* input,
+    const void* residual,
+    const void* weight,
+    void* output,
+    uint32_t batch_size,
+    uint32_t hidden_dim,
+    float eps,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/* ============================================================================
+ * RoPE API
+ * ============================================================================ */
+
+/**
+ * Apply RoPE to Q and K tensors using batch indptr/offsets.
+ *
+ * @param q           Query tensor [total_tokens, num_qo_heads, head_dim]
+ * @param k           Key tensor [total_tokens, num_kv_heads, head_dim]
+ * @param q_out       Output query tensor (can be same as q for in-place)
+ * @param k_out       Output key tensor (can be same as k for in-place)
+ * @param indptr      Token offsets [batch_size + 1]
+ * @param offsets     Position offsets [batch_size]
+ * @param batch_size  Number of sequences in batch
+ * @param num_qo_heads Number of query heads
+ * @param num_kv_heads Number of key heads
+ * @param head_dim    Head dimension
+ * @param config      RoPE configuration
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_apply_rope(
+    const void* q,
+    const void* k,
+    void* q_out,
+    void* k_out,
+    const int32_t* indptr,
+    const int32_t* offsets,
+    uint32_t batch_size,
+    uint32_t num_qo_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    const FlashInferRoPEConfig* config,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Apply RoPE in-place using batch indptr/offsets.
+ *
+ * @param q           Query tensor [total_tokens, num_qo_heads, head_dim] (modified in-place)
+ * @param k           Key tensor [total_tokens, num_kv_heads, head_dim] (modified in-place)
+ * @param indptr      Token offsets [batch_size + 1]
+ * @param offsets     Position offsets [batch_size]
+ * @param batch_size  Number of sequences in batch
+ * @param num_qo_heads Number of query heads
+ * @param num_kv_heads Number of key heads
+ * @param head_dim    Head dimension
+ * @param config      RoPE configuration
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_apply_rope_inplace(
+    void* q,
+    void* k,
+    const int32_t* indptr,
+    const int32_t* offsets,
+    uint32_t batch_size,
+    uint32_t num_qo_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    const FlashInferRoPEConfig* config,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Apply RoPE with explicit position IDs.
+ *
+ * @param q           Query tensor [total_tokens, num_qo_heads, head_dim]
+ * @param k           Key tensor [total_tokens, num_kv_heads, head_dim]
+ * @param q_out       Output query tensor
+ * @param k_out       Output key tensor
+ * @param pos_ids     Position IDs [total_tokens]
+ * @param total_tokens Total number of tokens
+ * @param num_qo_heads Number of query heads
+ * @param num_kv_heads Number of key heads
+ * @param head_dim    Head dimension
+ * @param config      RoPE configuration
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_apply_rope_pos_ids(
+    const void* q,
+    const void* k,
+    void* q_out,
+    void* k_out,
+    const int32_t* pos_ids,
+    uint32_t total_tokens,
+    uint32_t num_qo_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    const FlashInferRoPEConfig* config,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Apply RoPE with precomputed cos/sin cache.
+ *
+ * @param q           Query tensor
+ * @param k           Key tensor
+ * @param q_out       Output query tensor
+ * @param k_out       Output key tensor
+ * @param cos_cache   Precomputed cos values [max_seq_len, rotary_dim/2]
+ * @param sin_cache   Precomputed sin values [max_seq_len, rotary_dim/2]
+ * @param pos_ids     Position IDs [total_tokens]
+ * @param total_tokens Total number of tokens
+ * @param num_qo_heads Number of query heads
+ * @param num_kv_heads Number of key heads
+ * @param head_dim    Head dimension
+ * @param config      RoPE configuration (rotary_dim used)
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_apply_rope_with_cos_sin_cache(
+    const void* q,
+    const void* k,
+    void* q_out,
+    void* k_out,
+    const void* cos_cache,
+    const void* sin_cache,
+    const int32_t* pos_ids,
+    uint32_t total_tokens,
+    uint32_t num_qo_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    const FlashInferRoPEConfig* config,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/* ============================================================================
+ * Sampling API
+ * ============================================================================ */
+
+/**
+ * Top-K sampling from probability distribution.
+ *
+ * Uses Philox RNG for random number generation. The combination of
+ * philox_seed and philox_offset determines the random state.
+ *
+ * @param probs       Probability tensor [batch_size, vocab_size]
+ * @param output      Sampled indices [batch_size]
+ * @param top_k_arr   Per-batch Top-K values [batch_size] (NULL for uniform top_k_val)
+ * @param top_k_val   Default Top-K value (used when top_k_arr is NULL or per-batch)
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param deterministic Use deterministic sampling
+ * @param philox_seed Random seed for Philox RNG
+ * @param philox_offset Offset for Philox RNG
+ * @param dtype       Data type (float16 or bfloat16)
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_top_k_sampling(
+    const void* probs,
+    int32_t* output,
+    const int32_t* top_k_arr,
+    uint32_t top_k_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    int deterministic,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Top-P (nucleus) sampling from probability distribution.
+ *
+ * @param probs       Probability tensor [batch_size, vocab_size]
+ * @param output      Sampled indices [batch_size]
+ * @param top_p_arr   Per-batch Top-P values [batch_size] (NULL for uniform top_p_val)
+ * @param top_p_val   Default Top-P value (used when top_p_arr is NULL)
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param deterministic Use deterministic sampling
+ * @param philox_seed Random seed for Philox RNG
+ * @param philox_offset Offset for Philox RNG
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_top_p_sampling(
+    const void* probs,
+    int32_t* output,
+    const float* top_p_arr,
+    float top_p_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    int deterministic,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Min-P sampling from probability distribution.
+ *
+ * @param probs       Probability tensor [batch_size, vocab_size]
+ * @param output      Sampled indices [batch_size]
+ * @param min_p_arr   Per-batch Min-P values [batch_size] (NULL for uniform min_p_val)
+ * @param min_p_val   Default Min-P value (used when min_p_arr is NULL)
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param deterministic Use deterministic sampling
+ * @param philox_seed Random seed for Philox RNG
+ * @param philox_offset Offset for Philox RNG
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_min_p_sampling(
+    const void* probs,
+    int32_t* output,
+    const float* min_p_arr,
+    float min_p_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    int deterministic,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Combined Top-K + Top-P sampling.
+ *
+ * @param probs       Probability tensor [batch_size, vocab_size]
+ * @param output      Sampled indices [batch_size]
+ * @param top_k_arr   Per-batch Top-K values [batch_size] (NULL for uniform top_k_val)
+ * @param top_p_arr   Per-batch Top-P values [batch_size] (NULL for uniform top_p_val)
+ * @param top_k_val   Default Top-K value
+ * @param top_p_val   Default Top-P value
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param deterministic Use deterministic sampling
+ * @param philox_seed Random seed for Philox RNG
+ * @param philox_offset Offset for Philox RNG
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_top_k_top_p_sampling(
+    const void* probs,
+    int32_t* output,
+    const int32_t* top_k_arr,
+    const float* top_p_arr,
+    uint32_t top_k_val,
+    float top_p_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    int deterministic,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Softmax with optional temperature scaling.
+ *
+ * For large vocabularies (>24K) with small batches, this uses a multi-pass
+ * algorithm with workspace. Otherwise, uses a single-pass fused kernel.
+ *
+ * @param logits      Logits tensor [batch_size, vocab_size]
+ * @param probs       Output probability tensor [batch_size, vocab_size]
+ * @param temperature_arr Per-batch temperature values [batch_size] (NULL for temp_val)
+ * @param temp_val    Default temperature value (used when temperature_arr is NULL)
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_softmax(
+    const void* logits,
+    void* probs,
+    const float* temperature_arr,
+    float temp_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Apply Top-K mask to logits (set non-top-K to -inf).
+ *
+ * @param logits      Logits tensor [batch_size, vocab_size] (modified in-place)
+ * @param top_k_arr   Top-K values [batch_size]
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_top_k_mask_logits(
+    void* logits,
+    const int32_t* top_k_arr,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Renormalize probabilities after top-p filtering.
+ *
+ * @param probs       Probabilities [batch_size, vocab_size] (modified in-place)
+ * @param renormed_probs Output renormalized probs [batch_size, vocab_size] (can be same as probs)
+ * @param top_p_arr   Per-batch Top-P values [batch_size] (NULL for top_p_val)
+ * @param top_p_val   Default Top-P value (1.0 = no filtering, just normalize)
+ * @param batch_size  Batch size
+ * @param vocab_size  Vocabulary size
+ * @param dtype       Data type
+ * @param stream      CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_top_p_renorm_probs(
+    const void* probs,
+    void* renormed_probs,
+    const float* top_p_arr,
+    float top_p_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    FlashInferDType dtype,
+    void* stream
+);
+
 /* ============================================================================
  * Utility functions
  * ============================================================================ */
@@ -368,6 +1098,31 @@ FlashInferStatus flashinfer_check_gpu_support(
     int* supported,
     int* sm_version
 );
+
+/**
+ * Query device capabilities.
+ *
+ * @param device_id       CUDA device ID
+ * @param[out] compute_major Major compute capability
+ * @param[out] compute_minor Minor compute capability
+ * @param[out] sm_count   Number of SMs
+ * @param[out] supports_pdl Whether device supports PDL (SM90+)
+ * @param[out] supports_fp8 Whether device supports FP8 (SM89+)
+ * @return Status code
+ */
+FlashInferStatus flashinfer_get_device_info(
+    int device_id,
+    int* compute_major,
+    int* compute_minor,
+    int* sm_count,
+    int* supports_pdl,
+    int* supports_fp8
+);
+
+/**
+ * Set default CUDA stream for subsequent operations.
+ */
+FlashInferStatus flashinfer_set_stream(void* stream);
 
 #ifdef __cplusplus
 }

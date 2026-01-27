@@ -6,8 +6,8 @@
 
 use crate::cuda::Workspace;
 use crate::page_table::PageTable;
-use crate::{AttentionConfig, DataType, FlashInferError, Result};
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
+use crate::{AttentionConfig, FlashInferError, Result};
+use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::Arc;
 
 /// Handler for batched decode attention with paged KV cache.
@@ -87,10 +87,10 @@ impl BatchDecodeHandler {
         // Calculate workspace size
         let workspace_size = crate::cuda::batch_decode_workspace_size(
             batch_size,
-            self.config.num_qo_heads,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.config.page_size,
+            self.config.num_qo_heads as usize,
+            self.config.num_kv_heads as usize,
+            self.config.head_dim_qk as usize,
+            self.config.page_size as usize,
             page_table.max_num_pages(),
         );
 
@@ -138,22 +138,32 @@ impl BatchDecodeHandler {
             ));
         }
 
-        // TODO: Launch actual FlashInfer CUDA kernel
-        // For now, this is a placeholder that documents the expected interface
+        // TODO(Phase 2): Implement using ffi::BatchDecodePlan
         //
-        // The actual implementation would:
-        // 1. Upload page_table and kv_lengths to GPU
-        // 2. Launch flashinfer::BatchDecodeWithPagedKVCacheWrapper kernel
-        // 3. Synchronize and return
+        // This high-level handler is not yet functional. The implementation requires:
+        // 1. Store ffi::BatchDecodePlan handle in struct (created in plan())
+        // 2. Convert PageTable to kv_indptr/kv_indices/kv_last_page_len arrays
+        // 3. Upload these arrays to GPU
+        // 4. Call plan.run() with the GPU pointers
+        //
+        // WORKAROUND: Use ffi::BatchDecodePlan directly for now. Example:
+        //   let plan = unsafe { ffi::BatchDecodePlan::new(...) }?;
+        //   unsafe { plan.run(q, k_cache, v_cache, ...) }?;
+        //
+        // See ffi.rs for the working low-level API.
 
+        let _ = (query, kv_cache_k, kv_cache_v, page_table, kv_lengths, output, batch_size);
         Err(FlashInferError::unsupported(
-            "CUDA kernel not yet implemented - requires FlashInfer C++ bindings",
+            "BatchDecodeHandler::forward_inplace not implemented. Use ffi::BatchDecodePlan directly.",
         ))
     }
 }
 
 /// Marker trait for supported device pointer types.
-pub trait DevicePtrType: cudarc::driver::DeviceRepr + Clone {}
+///
+/// NOTE: This trait is a placeholder - actual CUDA operations require
+/// types that implement cudarc's internal traits.
+pub trait DevicePtrType: Copy + Send + Sync + 'static {}
 
 impl DevicePtrType for half::f16 {}
 impl DevicePtrType for half::bf16 {}

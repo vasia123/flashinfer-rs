@@ -65,6 +65,10 @@ fn check_status(status: FlashInferStatus) -> Result<()> {
             let msg = get_last_error().unwrap_or_else(|| "Internal error".to_string());
             Err(FlashInferError::Internal(msg))
         }
+        FlashInferStatus::FLASHINFER_NOT_INITIALIZED => {
+            let msg = get_last_error().unwrap_or_else(|| "Not initialized".to_string());
+            Err(FlashInferError::Internal(msg))
+        }
     }
 }
 
@@ -134,12 +138,14 @@ impl From<DType> for FlashInferDType {
     }
 }
 
-impl From<crate::DataType> for DType {
-    fn from(dtype: crate::DataType) -> Self {
+impl From<crate::types::DType> for DType {
+    fn from(dtype: crate::types::DType) -> Self {
         match dtype {
-            crate::DataType::Float16 => DType::Float16,
-            crate::DataType::BFloat16 => DType::BFloat16,
-            crate::DataType::Float32 => DType::Float32,
+            crate::types::DType::Float16 => DType::Float16,
+            crate::types::DType::BFloat16 => DType::BFloat16,
+            crate::types::DType::Float32 => DType::Float32,
+            crate::types::DType::Float8E4M3 => DType::Float8E4M3,
+            crate::types::DType::Float8E5M2 => DType::Float8E5M2,
         }
     }
 }
@@ -162,6 +168,15 @@ impl From<KVLayout> for FlashInferKVLayout {
     }
 }
 
+impl From<crate::types::KVLayout> for KVLayout {
+    fn from(layout: crate::types::KVLayout) -> Self {
+        match layout {
+            crate::types::KVLayout::HND => KVLayout::HND,
+            crate::types::KVLayout::NHD => KVLayout::NHD,
+        }
+    }
+}
+
 /// Position encoding mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PosEncoding {
@@ -169,6 +184,7 @@ pub enum PosEncoding {
     None,
     RoPELlama,
     ALiBi,
+    RoPELlamaFreqScale,
 }
 
 impl From<PosEncoding> for FlashInferPosEncoding {
@@ -177,6 +193,79 @@ impl From<PosEncoding> for FlashInferPosEncoding {
             PosEncoding::None => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_NONE,
             PosEncoding::RoPELlama => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA,
             PosEncoding::ALiBi => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ALIBI,
+            PosEncoding::RoPELlamaFreqScale => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE,
+        }
+    }
+}
+
+impl From<crate::types::PosEncodingMode> for PosEncoding {
+    fn from(mode: crate::types::PosEncodingMode) -> Self {
+        match mode {
+            crate::types::PosEncodingMode::None => PosEncoding::None,
+            crate::types::PosEncodingMode::RoPELlama => PosEncoding::RoPELlama,
+            crate::types::PosEncodingMode::ALiBi => PosEncoding::ALiBi,
+            crate::types::PosEncodingMode::RoPELlamaFreqScale => PosEncoding::RoPELlamaFreqScale,
+        }
+    }
+}
+
+/// Attention mask mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaskMode {
+    #[default]
+    None,
+    Causal,
+    Custom,
+}
+
+impl From<MaskMode> for FlashInferMaskMode {
+    fn from(mode: MaskMode) -> Self {
+        match mode {
+            MaskMode::None => FlashInferMaskMode_FLASHINFER_MASK_NONE,
+            MaskMode::Causal => FlashInferMaskMode_FLASHINFER_MASK_CAUSAL,
+            MaskMode::Custom => FlashInferMaskMode_FLASHINFER_MASK_CUSTOM,
+        }
+    }
+}
+
+impl From<crate::types::MaskMode> for MaskMode {
+    fn from(mode: crate::types::MaskMode) -> Self {
+        match mode {
+            crate::types::MaskMode::None => MaskMode::None,
+            crate::types::MaskMode::Causal => MaskMode::Causal,
+            crate::types::MaskMode::Custom => MaskMode::Custom,
+        }
+    }
+}
+
+/// Attention backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Auto,
+    FA2,
+    FA3,
+    CuDNN,
+}
+
+impl From<Backend> for FlashInferBackend {
+    fn from(backend: Backend) -> Self {
+        match backend {
+            Backend::Auto => FlashInferBackend_FLASHINFER_BACKEND_AUTO,
+            Backend::FA2 => FlashInferBackend_FLASHINFER_BACKEND_FA2,
+            Backend::FA3 => FlashInferBackend_FLASHINFER_BACKEND_FA3,
+            Backend::CuDNN => FlashInferBackend_FLASHINFER_BACKEND_CUDNN,
+        }
+    }
+}
+
+impl From<crate::types::Backend> for Backend {
+    fn from(backend: crate::types::Backend) -> Self {
+        match backend {
+            crate::types::Backend::Auto => Backend::Auto,
+            crate::types::Backend::FA2 => Backend::FA2,
+            crate::types::Backend::FA3 => Backend::FA3,
+            crate::types::Backend::CuDNN => Backend::CuDNN,
         }
     }
 }
@@ -498,6 +587,352 @@ pub unsafe fn append_paged_kv_cache(
     check_status(status)
 }
 
+// =============================================================================
+// RoPE API wrappers
+// =============================================================================
+
+/// Apply RoPE to Q and K tensors using batch indptr/offsets.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_rope(
+    q: *const std::ffi::c_void,
+    k: *const std::ffi::c_void,
+    q_out: *mut std::ffi::c_void,
+    k_out: *mut std::ffi::c_void,
+    indptr: *const i32,
+    offsets: *const i32,
+    batch_size: u32,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    config: &FlashInferRoPEConfig,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_apply_rope(
+        q,
+        k,
+        q_out,
+        k_out,
+        indptr,
+        offsets,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        config as *const FlashInferRoPEConfig,
+        dtype.into(),
+        stream,
+    );
+    check_status(status)
+}
+
+/// Apply RoPE in-place to Q and K tensors.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_rope_inplace(
+    q: *mut std::ffi::c_void,
+    k: *mut std::ffi::c_void,
+    indptr: *const i32,
+    offsets: *const i32,
+    batch_size: u32,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    config: &FlashInferRoPEConfig,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_apply_rope_inplace(
+        q,
+        k,
+        indptr,
+        offsets,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        config as *const FlashInferRoPEConfig,
+        dtype.into(),
+        stream,
+    );
+    check_status(status)
+}
+
+/// Apply RoPE with explicit position IDs.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_rope_pos_ids(
+    q: *const std::ffi::c_void,
+    k: *const std::ffi::c_void,
+    q_out: *mut std::ffi::c_void,
+    k_out: *mut std::ffi::c_void,
+    pos_ids: *const i32,
+    total_tokens: u32,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    config: &FlashInferRoPEConfig,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_apply_rope_pos_ids(
+        q,
+        k,
+        q_out,
+        k_out,
+        pos_ids,
+        total_tokens,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        config as *const FlashInferRoPEConfig,
+        dtype.into(),
+        stream,
+    );
+    check_status(status)
+}
+
+/// Apply RoPE with precomputed cos/sin cache.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_rope_with_cos_sin_cache(
+    q: *const std::ffi::c_void,
+    k: *const std::ffi::c_void,
+    q_out: *mut std::ffi::c_void,
+    k_out: *mut std::ffi::c_void,
+    cos_sin_cache: *const std::ffi::c_void,
+    pos_ids: *const i32,
+    total_tokens: u32,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    config: &FlashInferRoPEConfig,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_apply_rope_with_cos_sin_cache(
+        q,
+        k,
+        q_out,
+        k_out,
+        cos_sin_cache,
+        std::ptr::null(),  // sin_cache not used (combined in cos_sin_cache)
+        pos_ids,
+        total_tokens,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        config as *const FlashInferRoPEConfig,
+        dtype.into(),
+        stream,
+    );
+    check_status(status)
+}
+
+// =============================================================================
+// Sampling FFI Wrappers
+// =============================================================================
+
+/// Top-K sampling from probability distribution.
+///
+/// NOTE: Only supports float32 dtype due to type compatibility issues in FlashInfer's
+/// internal arithmetic with half/bf16 types.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn top_k_sampling(
+    probs: *const f32,
+    output: *mut i32,
+    top_k_arr: *const i32, // NULL for uniform top_k_val
+    top_k_val: u32,
+    batch_size: u32,
+    vocab_size: u32,
+    deterministic: bool,
+    philox_seed: u64,
+    philox_offset: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_top_k_sampling(
+        probs as *const std::ffi::c_void,
+        output,
+        top_k_arr,
+        top_k_val,
+        batch_size,
+        vocab_size,
+        if deterministic { 1 } else { 0 },
+        philox_seed,
+        philox_offset,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Top-P (nucleus) sampling from probability distribution.
+///
+/// NOTE: Only supports float32 dtype.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn top_p_sampling(
+    probs: *const f32,
+    output: *mut i32,
+    top_p_arr: *const f32, // NULL for uniform top_p_val
+    top_p_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    deterministic: bool,
+    philox_seed: u64,
+    philox_offset: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_top_p_sampling(
+        probs as *const std::ffi::c_void,
+        output,
+        top_p_arr,
+        top_p_val,
+        batch_size,
+        vocab_size,
+        if deterministic { 1 } else { 0 },
+        philox_seed,
+        philox_offset,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Min-P sampling from probability distribution.
+///
+/// NOTE: Only supports float32 dtype.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn min_p_sampling(
+    probs: *const f32,
+    output: *mut i32,
+    min_p_arr: *const f32, // NULL for uniform min_p_val
+    min_p_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    deterministic: bool,
+    philox_seed: u64,
+    philox_offset: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_min_p_sampling(
+        probs as *const std::ffi::c_void,
+        output,
+        min_p_arr,
+        min_p_val,
+        batch_size,
+        vocab_size,
+        if deterministic { 1 } else { 0 },
+        philox_seed,
+        philox_offset,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Combined Top-K + Top-P sampling.
+///
+/// NOTE: Only supports float32 dtype.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn top_k_top_p_sampling(
+    probs: *const f32,
+    output: *mut i32,
+    top_k_arr: *const i32, // NULL for uniform top_k_val
+    top_p_arr: *const f32, // NULL for uniform top_p_val
+    top_k_val: u32,
+    top_p_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    deterministic: bool,
+    philox_seed: u64,
+    philox_offset: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_top_k_top_p_sampling(
+        probs as *const std::ffi::c_void,
+        output,
+        top_k_arr,
+        top_p_arr,
+        top_k_val,
+        top_p_val,
+        batch_size,
+        vocab_size,
+        if deterministic { 1 } else { 0 },
+        philox_seed,
+        philox_offset,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Softmax with optional temperature scaling.
+///
+/// NOTE: Only supports float32 dtype.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn softmax(
+    logits: *const f32,
+    probs: *mut f32,
+    temperature_arr: *const f32, // NULL for uniform temp_val
+    temp_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_softmax(
+        logits as *const std::ffi::c_void,
+        probs as *mut std::ffi::c_void,
+        temperature_arr,
+        temp_val,
+        batch_size,
+        vocab_size,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Renormalize probabilities after top-p filtering.
+///
+/// NOTE: Only supports float32 dtype.
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn top_p_renorm_probs(
+    probs: *const f32,
+    renormed_probs: *mut f32,
+    top_p_arr: *const f32, // NULL for uniform top_p_val
+    top_p_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_top_p_renorm_probs(
+        probs as *const std::ffi::c_void,
+        renormed_probs as *mut std::ffi::c_void,
+        top_p_arr,
+        top_p_val,
+        batch_size,
+        vocab_size,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +953,10 @@ mod tests {
             FlashInferDType::from(DType::BFloat16),
             FlashInferDType::FLASHINFER_DTYPE_BFLOAT16
         );
+        assert_eq!(
+            FlashInferDType::from(DType::Float8E4M3),
+            FlashInferDType::FLASHINFER_DTYPE_FLOAT8_E4M3
+        );
     }
 
     #[test]
@@ -530,5 +969,72 @@ mod tests {
             FlashInferKVLayout::from(KVLayout::NHD),
             FlashInferKVLayout::FLASHINFER_KV_LAYOUT_NHD
         );
+    }
+
+    #[test]
+    fn test_pos_encoding_conversion() {
+        assert_eq!(
+            FlashInferPosEncoding::from(PosEncoding::None),
+            FlashInferPosEncoding::FLASHINFER_POS_ENCODING_NONE
+        );
+        assert_eq!(
+            FlashInferPosEncoding::from(PosEncoding::RoPELlama),
+            FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA
+        );
+        assert_eq!(
+            FlashInferPosEncoding::from(PosEncoding::RoPELlamaFreqScale),
+            FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE
+        );
+    }
+
+    #[test]
+    fn test_mask_mode_conversion() {
+        assert_eq!(
+            FlashInferMaskMode::from(MaskMode::None),
+            FlashInferMaskMode_FLASHINFER_MASK_NONE
+        );
+        assert_eq!(
+            FlashInferMaskMode::from(MaskMode::Causal),
+            FlashInferMaskMode_FLASHINFER_MASK_CAUSAL
+        );
+        assert_eq!(
+            FlashInferMaskMode::from(MaskMode::Custom),
+            FlashInferMaskMode_FLASHINFER_MASK_CUSTOM
+        );
+    }
+
+    #[test]
+    fn test_backend_conversion() {
+        assert_eq!(
+            FlashInferBackend::from(Backend::Auto),
+            FlashInferBackend_FLASHINFER_BACKEND_AUTO
+        );
+        assert_eq!(
+            FlashInferBackend::from(Backend::FA2),
+            FlashInferBackend_FLASHINFER_BACKEND_FA2
+        );
+        assert_eq!(
+            FlashInferBackend::from(Backend::FA3),
+            FlashInferBackend_FLASHINFER_BACKEND_FA3
+        );
+    }
+
+    #[test]
+    fn test_types_module_conversions() {
+        // Test conversion from types module types to FFI types
+        let dtype: DType = crate::types::DType::Float16.into();
+        assert_eq!(dtype, DType::Float16);
+
+        let layout: KVLayout = crate::types::KVLayout::NHD.into();
+        assert_eq!(layout, KVLayout::NHD);
+
+        let pos_enc: PosEncoding = crate::types::PosEncodingMode::RoPELlama.into();
+        assert_eq!(pos_enc, PosEncoding::RoPELlama);
+
+        let mask: MaskMode = crate::types::MaskMode::Causal.into();
+        assert_eq!(mask, MaskMode::Causal);
+
+        let backend: Backend = crate::types::Backend::FA2.into();
+        assert_eq!(backend, Backend::FA2);
     }
 }

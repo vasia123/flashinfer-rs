@@ -2,7 +2,7 @@
 //!
 //! This module provides CUDA memory management for FlashInfer operations.
 
-use crate::{FlashInferError, Result};
+use crate::Result;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use std::sync::Arc;
 
@@ -40,9 +40,11 @@ impl Workspace {
         Ok(())
     }
 
-    /// Get the workspace buffer pointer.
-    pub fn ptr(&self) -> Option<DevicePtr<u8>> {
-        self.buffer.as_ref().map(|b| *b.device_ptr())
+    /// Get the workspace buffer pointer as a raw pointer.
+    pub fn ptr(&self) -> Option<*mut u8> {
+        self.buffer
+            .as_ref()
+            .map(|b| *b.device_ptr() as *mut u8)
     }
 
     /// Get the current workspace size.
@@ -62,12 +64,12 @@ pub fn batch_decode_workspace_size(
     num_qo_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    page_size: usize,
+    _page_size: usize,
     max_num_pages: usize,
 ) -> usize {
     // Based on FlashInfer's workspace requirements
     // This is a conservative estimate
-    let qo_heads_per_kv = num_qo_heads / num_kv_heads;
+    let _qo_heads_per_kv = num_qo_heads / num_kv_heads;
 
     // Partition info
     let partition_size = batch_size * num_kv_heads * 2 * std::mem::size_of::<i32>();
@@ -91,10 +93,10 @@ pub fn batch_prefill_workspace_size(
     num_qo_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    page_size: usize,
+    _page_size: usize,
 ) -> usize {
     // Prefill typically needs more workspace due to larger attention matrices
-    let qo_heads_per_kv = num_qo_heads / num_kv_heads;
+    let _qo_heads_per_kv = num_qo_heads / num_kv_heads;
 
     // Request indices and positions
     let request_info_size = batch_size * 3 * std::mem::size_of::<i32>();

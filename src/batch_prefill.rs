@@ -68,7 +68,7 @@ impl BatchPrefillHandler {
         qo_indptr: &[i32],
         kv_indptr: &[i32],
         kv_lengths: &[usize],
-        page_table: &PageTable,
+        _page_table: &PageTable,
     ) -> Result<()> {
         if qo_indptr.len() != kv_indptr.len() {
             return Err(FlashInferError::invalid_config(format!(
@@ -93,10 +93,10 @@ impl BatchPrefillHandler {
         let workspace_size = crate::cuda::batch_prefill_workspace_size(
             batch_size,
             total_tokens,
-            self.config.num_qo_heads,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.config.page_size,
+            self.config.num_qo_heads as usize,
+            self.config.num_kv_heads as usize,
+            self.config.head_dim_qk as usize,
+            self.config.page_size as usize,
         );
 
         self.workspace.ensure_size(workspace_size)?;
@@ -142,17 +142,23 @@ impl BatchPrefillHandler {
             ));
         }
 
-        // TODO: Launch actual FlashInfer CUDA kernel
-        // For now, this is a placeholder that documents the expected interface
+        // TODO(Phase 2): Implement using ffi::BatchPrefillPlan
         //
-        // The actual implementation would:
-        // 1. Upload page_table, qo_indptr, kv_indptr to GPU
-        // 2. Launch flashinfer::BatchPrefillWithPagedKVCacheWrapper kernel
-        // 3. Handle causal masking
-        // 4. Synchronize and return
+        // This high-level handler is not yet functional. The implementation requires:
+        // 1. Store ffi::BatchPrefillPlan handle in struct (created in plan())
+        // 2. Convert PageTable to kv_indptr/kv_indices/kv_last_page_len arrays
+        // 3. Upload these arrays plus qo_indptr to GPU
+        // 4. Call plan.run() with the GPU pointers
+        //
+        // WORKAROUND: Use ffi::BatchPrefillPlan directly for now. Example:
+        //   let plan = unsafe { ffi::BatchPrefillPlan::new(...) }?;
+        //   unsafe { plan.run(q, k_cache, v_cache, ...) }?;
+        //
+        // See ffi.rs for the working low-level API.
 
+        let _ = (query, key, value, kv_cache_k, kv_cache_v, page_table, qo_indptr, kv_indptr, output);
         Err(FlashInferError::unsupported(
-            "CUDA kernel not yet implemented - requires FlashInfer C++ bindings",
+            "BatchPrefillHandler::forward_inplace not implemented. Use ffi::BatchPrefillPlan directly.",
         ))
     }
 
@@ -180,10 +186,19 @@ impl BatchPrefillHandler {
             ));
         }
 
-        // TODO: Implement fused prefill + append kernel
+        // TODO(Phase 2): Implement fused prefill + append kernel
+        //
+        // This would combine prefill attention with KV cache append in one kernel
+        // to reduce memory bandwidth. FlashInfer may not have a direct fused API,
+        // so this might require:
+        // 1. Run prefill attention via ffi::BatchPrefillPlan
+        // 2. Append KV to cache via ffi::append_paged_kv_cache
+        //
+        // WORKAROUND: Call forward_inplace() then append_paged_kv_cache() separately.
 
+        let _ = (query, key, value, kv_cache_k, kv_cache_v, page_table, qo_indptr, kv_indptr, append_indptr, output);
         Err(FlashInferError::unsupported(
-            "Fused prefill+append not yet implemented",
+            "Fused prefill+append not implemented. Call forward_inplace() then append_paged_kv_cache() separately.",
         ))
     }
 }
