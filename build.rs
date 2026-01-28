@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 const CUDA_MODULES: &[&str] = &[
     "flashinfer_decode.cu",     // Batch decode attention (8 variants) - slowest
     "flashinfer_prefill.cu",    // Batch prefill attention (8 variants) - slowest
+    "flashinfer_mla.cu",        // DeepSeek MLA attention (fixed dims)
     "flashinfer_norm.cu",       // RMSNorm, LayerNorm, etc.
     "flashinfer_sampling.cu",   // top_k, top_p, etc.
     "flashinfer_rope.cu",       // Rotary position embedding

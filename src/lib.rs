@@ -54,6 +54,7 @@ pub mod batch_prefill;
 #[cfg(feature = "cuda")]
 pub mod ops;
 
+pub mod mla;
 pub mod page;
 
 // Re-export core types
@@ -76,6 +77,9 @@ pub use page::{PagedKVCacheBuilder, PagedKVMetadata};
 
 #[cfg(feature = "cuda")]
 pub use page::PagedKVCache;
+
+// MLA (DeepSeek) support
+pub use mla::{MLAConfig, MLAKeyShape, MLAQueryShape};
 
 // Backwards compatibility re-exports
 pub use types::DType as DataType;

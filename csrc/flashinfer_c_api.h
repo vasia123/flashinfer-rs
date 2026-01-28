@@ -1141,6 +1141,197 @@ FlashInferStatus flashinfer_top_p_renorm_probs(
 );
 
 /* ============================================================================
+ * MLA (Multi-head Latent Attention) API - DeepSeek Support
+ * ============================================================================ */
+
+/**
+ * Opaque handle for MLA attention plan.
+ */
+typedef struct FlashInferMLAPlan* FlashInferMLAPlanHandle;
+
+/**
+ * Append compressed KV and k_pe to MLA paged cache.
+ *
+ * MLA uses two separate caches:
+ * - ckv_cache: compressed KV (dimension 512 for DeepSeek)
+ * - kpe_cache: K position embedding (dimension 64 for DeepSeek)
+ *
+ * @param append_ckv       Compressed KV to append [nnz, head_dim_ckv=512]
+ * @param append_kpe       K position embeddings [nnz, head_dim_kpe=64]
+ * @param ckv_cache        Paged compressed KV cache [num_pages, page_size, 512]
+ * @param kpe_cache        Paged K-PE cache [num_pages, page_size, 64]
+ * @param kv_indptr        Page offsets [batch_size + 1]
+ * @param kv_indices       Page indices [total_pages]
+ * @param kv_last_page_len Tokens in last page [batch_size]
+ * @param batch_indices    Batch index for each token [nnz]
+ * @param positions        Position for each token [nnz]
+ * @param nnz              Total number of tokens
+ * @param batch_size       Number of sequences
+ * @param page_size        Tokens per page
+ * @param dtype            Data type (fp16/bf16)
+ * @param stream           CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_append_paged_mla_kv_cache(
+    const void* append_ckv,
+    const void* append_kpe,
+    void* ckv_cache,
+    void* kpe_cache,
+    const int32_t* kv_indptr,
+    const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    const int32_t* batch_indices,
+    const int32_t* positions,
+    uint32_t nnz,
+    uint32_t batch_size,
+    uint32_t page_size,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Concatenate k_nope and k_rope for MLA.
+ *
+ * k_nope: [num_tokens, num_heads=128, nope_dim=128]
+ * k_rope: [num_tokens, 1, rope_dim=64] (broadcast to all heads)
+ * k:      [num_tokens, num_heads=128, k_head_dim=192]
+ *
+ * @param k                Output tensor [num_tokens, 128, 192]
+ * @param k_nope           Input k_nope tensor [num_tokens, 128, 128]
+ * @param k_rope           Input k_rope tensor [num_tokens, 1, 64] (shared)
+ * @param num_tokens       Number of tokens
+ * @param k_stride_n       Token stride for k
+ * @param k_stride_h       Head stride for k
+ * @param k_nope_stride_n  Token stride for k_nope
+ * @param k_nope_stride_h  Head stride for k_nope
+ * @param k_rope_stride_n  Token stride for k_rope
+ * @param dtype            Data type
+ * @param stream           CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_concat_mla_k(
+    void* k,
+    const void* k_nope,
+    const void* k_rope,
+    int32_t num_tokens,
+    int64_t k_stride_n,
+    int32_t k_stride_h,
+    int64_t k_nope_stride_n,
+    int32_t k_nope_stride_h,
+    int64_t k_rope_stride_n,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Create MLA attention plan.
+ *
+ * @param[out] plan_handle       Handle to created plan
+ * @param float_workspace        GPU float workspace buffer
+ * @param float_workspace_size   Size of float workspace
+ * @param int_workspace          GPU int workspace buffer
+ * @param int_workspace_size     Size of int workspace
+ * @param page_locked_workspace  Page-locked host memory (can be NULL)
+ * @param page_locked_size       Size of page-locked buffer
+ * @param qo_indptr              Query token offsets [batch_size + 1]
+ * @param kv_indptr              KV page offsets [batch_size + 1]
+ * @param kv_len                 KV lengths [batch_size]
+ * @param batch_size             Number of sequences
+ * @param num_heads              Number of attention heads (128 for DeepSeek)
+ * @param head_dim_ckv           Compressed KV head dim (512)
+ * @param head_dim_kpe           K position embedding dim (64)
+ * @param page_size              Tokens per page
+ * @param causal                 Whether to apply causal masking
+ * @param stream                 CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_mla_plan(
+    FlashInferMLAPlanHandle* plan_handle,
+    void* float_workspace,
+    size_t float_workspace_size,
+    void* int_workspace,
+    size_t int_workspace_size,
+    void* page_locked_workspace,
+    size_t page_locked_size,
+    const int32_t* qo_indptr,
+    const int32_t* kv_indptr,
+    const int32_t* kv_len,
+    int32_t batch_size,
+    int32_t num_heads,
+    int32_t head_dim_ckv,
+    int32_t head_dim_kpe,
+    int32_t page_size,
+    int causal,
+    void* stream
+);
+
+/**
+ * Execute MLA attention with paged KV cache.
+ *
+ * @param plan_handle    Plan from flashinfer_mla_plan
+ * @param q_nope         Query nope [nnz, num_heads, head_dim_ckv=512]
+ * @param q_pe           Query PE [nnz, num_heads, head_dim_kpe=64]
+ * @param ckv_cache      Compressed KV cache [num_pages, page_size, 512]
+ * @param kpe_cache      K position embedding cache [num_pages, page_size, 64]
+ * @param kv_indices     Page indices [total_pages]
+ * @param output         Output tensor [nnz, num_heads, head_dim_ckv=512]
+ * @param lse            Optional LSE output [nnz, num_heads] (NULL to skip)
+ * @param mask_mode      Attention mask mode
+ * @param sm_scale       Softmax scale (1/sqrt(192) for DeepSeek)
+ * @param dtype_q        Query dtype
+ * @param dtype_kv       KV dtype
+ * @param stream         CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_mla_run(
+    FlashInferMLAPlanHandle plan_handle,
+    const void* q_nope,
+    const void* q_pe,
+    const void* ckv_cache,
+    const void* kpe_cache,
+    const int32_t* kv_indices,
+    void* output,
+    float* lse,
+    FlashInferMaskMode mask_mode,
+    float sm_scale,
+    FlashInferDType dtype_q,
+    FlashInferDType dtype_kv,
+    void* stream
+);
+
+/**
+ * Destroy MLA plan and free resources.
+ *
+ * @param plan_handle Handle to destroy
+ * @return Status code
+ */
+FlashInferStatus flashinfer_mla_plan_destroy(FlashInferMLAPlanHandle plan_handle);
+
+/**
+ * Get required workspace sizes for MLA attention.
+ *
+ * @param[out] float_size    Required float workspace size
+ * @param[out] int_size      Required int workspace size
+ * @param batch_size         Number of sequences
+ * @param max_seq_len        Maximum sequence length
+ * @param num_heads          Number of heads (128)
+ * @param head_dim_ckv       Compressed KV dim (512)
+ * @param head_dim_kpe       K PE dim (64)
+ * @param page_size          Tokens per page
+ * @return Status code
+ */
+FlashInferStatus flashinfer_mla_workspace_size(
+    size_t* float_size,
+    size_t* int_size,
+    int32_t batch_size,
+    int32_t max_seq_len,
+    int32_t num_heads,
+    int32_t head_dim_ckv,
+    int32_t head_dim_kpe,
+    int32_t page_size
+);
+
+/* ============================================================================
  * Utility functions
  * ============================================================================ */
 

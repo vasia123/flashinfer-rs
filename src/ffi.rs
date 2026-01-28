@@ -944,6 +944,255 @@ pub unsafe fn top_p_renorm_probs(
 }
 
 // =============================================================================
+// MLA (Multi-head Latent Attention) FFI Wrappers - DeepSeek Support
+// =============================================================================
+
+/// Get required workspace sizes for MLA attention.
+///
+/// MLA uses fixed dimensions: head_dim_ckv=512, head_dim_kpe=64, num_heads=128
+pub fn mla_workspace_size(
+    batch_size: i32,
+    max_seq_len: i32,
+    num_heads: i32,
+    head_dim_ckv: i32,
+    head_dim_kpe: i32,
+    page_size: i32,
+) -> Result<(usize, usize)> {
+    let mut float_size: usize = 0;
+    let mut int_size: usize = 0;
+
+    let status = unsafe {
+        flashinfer_mla_workspace_size(
+            &mut float_size,
+            &mut int_size,
+            batch_size,
+            max_seq_len,
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+        )
+    };
+
+    check_status(status)?;
+    Ok((float_size, int_size))
+}
+
+/// RAII wrapper for MLA attention plan.
+pub struct MLAPlan {
+    handle: FlashInferMLAPlanHandle,
+}
+
+impl MLAPlan {
+    /// Create a new MLA attention plan.
+    ///
+    /// MLA uses fixed dimensions: head_dim_ckv=512, head_dim_kpe=64, num_heads=128
+    ///
+    /// # Arguments
+    /// * `float_workspace` - GPU buffer for float workspace
+    /// * `int_workspace` - GPU buffer for int workspace
+    /// * `page_locked_workspace` - Page-locked host memory (can be null)
+    /// * `qo_indptr` - Query token offsets [batch_size + 1]
+    /// * `kv_indptr` - KV page offsets [batch_size + 1]
+    /// * `kv_len` - KV lengths [batch_size]
+    /// * `batch_size` - Number of sequences
+    /// * `num_heads` - Number of attention heads (128 for DeepSeek)
+    /// * `head_dim_ckv` - Compressed KV head dim (512)
+    /// * `head_dim_kpe` - K position embedding dim (64)
+    /// * `page_size` - Tokens per page
+    /// * `causal` - Whether to apply causal masking
+    /// * `stream` - CUDA stream
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn new(
+        float_workspace: *mut std::ffi::c_void,
+        float_workspace_size: usize,
+        int_workspace: *mut std::ffi::c_void,
+        int_workspace_size: usize,
+        page_locked_workspace: *mut std::ffi::c_void,
+        page_locked_size: usize,
+        qo_indptr: *const i32,
+        kv_indptr: *const i32,
+        kv_len: *const i32,
+        batch_size: i32,
+        num_heads: i32,
+        head_dim_ckv: i32,
+        head_dim_kpe: i32,
+        page_size: i32,
+        causal: bool,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<Self> {
+        let mut handle: FlashInferMLAPlanHandle = ptr::null_mut();
+
+        let status = flashinfer_mla_plan(
+            &mut handle,
+            float_workspace,
+            float_workspace_size,
+            int_workspace,
+            int_workspace_size,
+            page_locked_workspace,
+            page_locked_size,
+            qo_indptr,
+            kv_indptr,
+            kv_len,
+            batch_size,
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            if causal { 1 } else { 0 },
+            stream,
+        );
+
+        check_status(status)?;
+        Ok(Self { handle })
+    }
+
+    /// Execute MLA attention with this plan.
+    ///
+    /// # Arguments
+    /// * `q_nope` - Query nope [nnz, num_heads, head_dim_ckv=512]
+    /// * `q_pe` - Query PE [nnz, num_heads, head_dim_kpe=64]
+    /// * `ckv_cache` - Compressed KV cache [num_pages, page_size, 512]
+    /// * `kpe_cache` - K position embedding cache [num_pages, page_size, 64]
+    /// * `kv_indices` - Page indices [total_pages]
+    /// * `output` - Output tensor [nnz, num_heads, head_dim_ckv=512]
+    /// * `lse` - Optional LSE output [nnz, num_heads] (null to skip)
+    /// * `mask_mode` - Attention mask mode
+    /// * `sm_scale` - Softmax scale (1/sqrt(192) for DeepSeek, or 0 for auto)
+    /// * `dtype_q` - Query dtype
+    /// * `dtype_kv` - KV dtype
+    /// * `stream` - CUDA stream
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run(
+        &self,
+        q_nope: *const std::ffi::c_void,
+        q_pe: *const std::ffi::c_void,
+        ckv_cache: *const std::ffi::c_void,
+        kpe_cache: *const std::ffi::c_void,
+        kv_indices: *const i32,
+        output: *mut std::ffi::c_void,
+        lse: *mut f32,
+        mask_mode: MaskMode,
+        sm_scale: f32,
+        dtype_q: DType,
+        dtype_kv: DType,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        let status = flashinfer_mla_run(
+            self.handle,
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            kv_indices,
+            output,
+            lse,
+            mask_mode.into(),
+            sm_scale,
+            dtype_q.into(),
+            dtype_kv.into(),
+            stream,
+        );
+
+        check_status(status)
+    }
+}
+
+impl Drop for MLAPlan {
+    fn drop(&mut self) {
+        unsafe {
+            flashinfer_mla_plan_destroy(self.handle);
+        }
+    }
+}
+
+unsafe impl Send for MLAPlan {}
+
+/// Append compressed KV and k_pe to MLA paged cache.
+///
+/// MLA uses two separate caches:
+/// - ckv_cache: compressed KV (dimension 512 for DeepSeek)
+/// - kpe_cache: K position embedding (dimension 64 for DeepSeek)
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn append_paged_mla_kv_cache(
+    append_ckv: *const std::ffi::c_void,
+    append_kpe: *const std::ffi::c_void,
+    ckv_cache: *mut std::ffi::c_void,
+    kpe_cache: *mut std::ffi::c_void,
+    kv_indptr: *const i32,
+    kv_indices: *const i32,
+    kv_last_page_len: *const i32,
+    batch_indices: *const i32,
+    positions: *const i32,
+    nnz: u32,
+    batch_size: u32,
+    page_size: u32,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_append_paged_mla_kv_cache(
+        append_ckv,
+        append_kpe,
+        ckv_cache,
+        kpe_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        batch_indices,
+        positions,
+        nnz,
+        batch_size,
+        page_size,
+        dtype.into(),
+        stream,
+    );
+
+    check_status(status)
+}
+
+/// Concatenate k_nope and k_rope for MLA.
+///
+/// k_nope: [num_tokens, num_heads=128, nope_dim=128]
+/// k_rope: [num_tokens, 1, rope_dim=64] (broadcast to all heads)
+/// k:      [num_tokens, num_heads=128, k_head_dim=192]
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn concat_mla_k(
+    k: *mut std::ffi::c_void,
+    k_nope: *const std::ffi::c_void,
+    k_rope: *const std::ffi::c_void,
+    num_tokens: i32,
+    k_stride_n: i64,
+    k_stride_h: i32,
+    k_nope_stride_n: i64,
+    k_nope_stride_h: i32,
+    k_rope_stride_n: i64,
+    dtype: DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_concat_mla_k(
+        k,
+        k_nope,
+        k_rope,
+        num_tokens,
+        k_stride_n,
+        k_stride_h,
+        k_nope_stride_n,
+        k_nope_stride_h,
+        k_rope_stride_n,
+        dtype.into(),
+        stream,
+    );
+
+    check_status(status)
+}
+
+// =============================================================================
 // Fused RoPE + Quantize + Append FFI Wrapper
 // =============================================================================
 
@@ -1105,5 +1354,43 @@ mod tests {
 
         let backend: Backend = crate::types::Backend::FA2.into();
         assert_eq!(backend, Backend::FA2);
+    }
+
+    #[test]
+    fn test_mla_workspace_size() {
+        // MLA workspace size calculation (no GPU required)
+        // DeepSeek configuration: num_heads=128, head_dim_ckv=512, head_dim_kpe=64
+        let result = mla_workspace_size(
+            4,    // batch_size
+            2048, // max_seq_len
+            128,  // num_heads
+            512,  // head_dim_ckv
+            64,   // head_dim_kpe
+            16,   // page_size
+        );
+
+        // Should succeed and return reasonable sizes
+        assert!(result.is_ok());
+        let (float_size, int_size) = result.unwrap();
+        // Float workspace should be substantial for partial outputs
+        assert!(float_size > 0);
+        // Int workspace for indptr arrays
+        assert!(int_size > 0);
+    }
+
+    #[test]
+    fn test_mla_workspace_size_invalid_dims() {
+        // MLA requires specific dimensions
+        let result = mla_workspace_size(
+            4,    // batch_size
+            2048, // max_seq_len
+            128,  // num_heads
+            256,  // head_dim_ckv - WRONG (should be 512)
+            64,   // head_dim_kpe
+            16,   // page_size
+        );
+
+        // Should fail with invalid argument
+        assert!(result.is_err());
     }
 }
