@@ -25,13 +25,14 @@ use std::path::{Path, PathBuf};
 /// CUDA source modules for incremental compilation.
 /// Split from monolithic flashinfer_c_api.cu for faster rebuilds.
 const CUDA_MODULES: &[&str] = &[
-    "flashinfer_decode.cu",   // Batch decode attention (8 variants) - slowest
-    "flashinfer_prefill.cu",  // Batch prefill attention (8 variants) - slowest
-    "flashinfer_norm.cu",     // RMSNorm, LayerNorm, etc.
-    "flashinfer_sampling.cu", // top_k, top_p, etc.
-    "flashinfer_rope.cu",     // Rotary position embedding
-    "flashinfer_page.cu",     // KV cache append
-    "flashinfer_utils.cu",    // Utilities (GPU info, workspace)
+    "flashinfer_decode.cu",     // Batch decode attention (8 variants) - slowest
+    "flashinfer_prefill.cu",    // Batch prefill attention (8 variants) - slowest
+    "flashinfer_norm.cu",       // RMSNorm, LayerNorm, etc.
+    "flashinfer_sampling.cu",   // top_k, top_p, etc.
+    "flashinfer_rope.cu",       // Rotary position embedding
+    "flashinfer_rope_quant.cu", // RoPE + Quantize + Append (SM89+)
+    "flashinfer_page.cu",       // KV cache append
+    "flashinfer_utils.cu",      // Utilities (GPU info, workspace)
 ];
 
 fn main() {

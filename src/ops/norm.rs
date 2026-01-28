@@ -229,6 +229,77 @@ pub fn rmsnorm_inplace<T: GpuFloat>(
     check_status(status)
 }
 
+/// RMSNorm with FP8 quantized output.
+///
+/// Applies RMSNorm and quantizes the output to FP8 format in a single fused operation.
+/// This is useful for inference with quantized models.
+///
+/// **Requires SM89+ GPU (Ada Lovelace, Hopper, or newer).** Will return
+/// `Unsupported` error on older GPUs.
+///
+/// # Arguments
+///
+/// * `input` - Input tensor of shape `[batch_size, hidden_dim]` (FP16 or BF16)
+/// * `weight` - Weight tensor of shape `[hidden_dim]` (same type as input)
+/// * `output` - Output tensor of shape `[batch_size, hidden_dim]` (FP8)
+/// * `scale` - Quantization scale (output = normalized_value / scale, clamped to [-448, 448])
+/// * `batch_size` - Number of rows
+/// * `hidden_dim` - Hidden dimension (number of columns)
+/// * `config` - Normalization configuration
+/// * `output_dtype` - Output FP8 type (Float8E4M3 or Float8E5M2)
+/// * `stream` - CUDA stream
+///
+/// # Notes
+///
+/// - The scale parameter is a divisor: quantized = normalized / scale
+/// - Values are clamped to [-448, 448] before conversion to FP8
+/// - FP8 E4M3 format provides better precision for values near zero
+/// - FP8 E5M2 format provides larger dynamic range
+#[cfg(feature = "cuda")]
+pub fn rmsnorm_quant<T: GpuFloat>(
+    input: &CudaSlice<T>,
+    weight: &CudaSlice<T>,
+    output: &mut CudaSlice<u8>, // FP8 is stored as u8
+    scale: f32,
+    batch_size: u32,
+    hidden_dim: u32,
+    config: &NormConfig,
+    output_dtype: DType,
+    stream: &CudaStream,
+) -> Result<()> {
+    // Validate output dtype is FP8
+    if output_dtype != DType::Float8E4M3 && output_dtype != DType::Float8E5M2 {
+        return Err(crate::FlashInferError::invalid_config(
+            "rmsnorm_quant output must be FP8 (Float8E4M3 or Float8E5M2)",
+        ));
+    }
+
+    // Validate input dtype is FP16 or BF16
+    if T::DTYPE != DType::Float16 && T::DTYPE != DType::BFloat16 {
+        return Err(crate::FlashInferError::invalid_config(
+            "rmsnorm_quant input must be FP16 or BF16",
+        ));
+    }
+
+    let mut scale_val = scale;
+    let status = unsafe {
+        ffi::flashinfer_rmsnorm_quant(
+            *input.device_ptr() as *const std::ffi::c_void,
+            *weight.device_ptr() as *const std::ffi::c_void,
+            *output.device_ptr() as *mut std::ffi::c_void,
+            &mut scale_val,
+            batch_size,
+            hidden_dim,
+            config.eps,
+            dtype_to_ffi(T::DTYPE),
+            dtype_to_ffi(output_dtype),
+            stream.stream as *mut std::ffi::c_void,
+        )
+    };
+
+    check_status(status)
+}
+
 /// Fused residual add and RMSNorm.
 ///
 /// Computes: input += residual; output = RMSNorm(input) * weight
@@ -478,9 +549,7 @@ mod tests {
 
     #[test]
     fn test_layernorm_params() {
-        let params = LayerNormParams::new(4096)
-            .with_eps(1e-5)
-            .without_bias();
+        let params = LayerNormParams::new(4096).with_eps(1e-5).without_bias();
 
         assert_eq!(params.hidden_dim, 4096);
         assert!(!params.use_bias);

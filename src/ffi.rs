@@ -193,7 +193,9 @@ impl From<PosEncoding> for FlashInferPosEncoding {
             PosEncoding::None => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_NONE,
             PosEncoding::RoPELlama => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA,
             PosEncoding::ALiBi => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ALIBI,
-            PosEncoding::RoPELlamaFreqScale => FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE,
+            PosEncoding::RoPELlamaFreqScale => {
+                FlashInferPosEncoding::FLASHINFER_POS_ENCODING_ROPE_LLAMA_FREQ_SCALE
+            }
         }
     }
 }
@@ -721,7 +723,7 @@ pub unsafe fn apply_rope_with_cos_sin_cache(
         q_out,
         k_out,
         cos_sin_cache,
-        std::ptr::null(),  // sin_cache not used (combined in cos_sin_cache)
+        std::ptr::null(), // sin_cache not used (combined in cos_sin_cache)
         pos_ids,
         total_tokens,
         num_qo_heads,
@@ -936,6 +938,65 @@ pub unsafe fn top_p_renorm_probs(
         batch_size,
         vocab_size,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+// =============================================================================
+// Fused RoPE + Quantize + Append FFI Wrapper
+// =============================================================================
+
+/// Fused RoPE + Quantize + Append to paged KV cache (requires SM89+).
+///
+/// This operation combines:
+/// 1. Apply RoPE to Q_rope and K_rope tensors
+/// 2. Quantize all outputs to FP8
+/// 3. Append K/V to paged cache
+///
+/// # Safety
+/// All pointers must be valid and point to device memory with correct sizes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rope_quant_append_paged_kv_cache(
+    q_rope_in: *const std::ffi::c_void,
+    k_rope_in: *const std::ffi::c_void,
+    q_nope_in: *const std::ffi::c_void,
+    k_nope_in: *const std::ffi::c_void,
+    v_in: *const std::ffi::c_void,
+    q_rope_out: *mut std::ffi::c_void,
+    q_nope_out: *mut std::ffi::c_void,
+    k_cache: *mut std::ffi::c_void,
+    v_cache: *mut std::ffi::c_void,
+    kv_indptr: *const i32,
+    kv_indices: *const i32,
+    kv_last_page_len: *const i32,
+    batch_indices: *const i32,
+    positions: *const i32,
+    cos_sin_cache: *const f32,
+    pos_ids: *const i32,
+    nnz: u32,
+    config: &FlashInferRopeQuantAppendConfig,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_rope_quant_append_paged_kv_cache(
+        q_rope_in,
+        k_rope_in,
+        q_nope_in,
+        k_nope_in,
+        v_in,
+        q_rope_out,
+        q_nope_out,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        batch_indices,
+        positions,
+        cos_sin_cache,
+        pos_ids,
+        nnz,
+        config as *const FlashInferRopeQuantAppendConfig,
         stream,
     );
     check_status(status)

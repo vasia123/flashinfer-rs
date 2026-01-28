@@ -475,8 +475,14 @@ fn test_batch_prefill_sliding_window() {
     let has_nan = output_host.iter().any(|x| x.is_nan());
     let has_inf = output_host.iter().any(|x| x.is_infinite());
 
-    assert!(!has_nan, "Sliding window prefill output contains NaN values");
-    assert!(!has_inf, "Sliding window prefill output contains Inf values");
+    assert!(
+        !has_nan,
+        "Sliding window prefill output contains NaN values"
+    );
+    assert!(
+        !has_inf,
+        "Sliding window prefill output contains Inf values"
+    );
 
     // Verify output is not all zeros
     let all_zero = output_host.iter().all(|x| x.to_f32() == 0.0);
@@ -668,8 +674,14 @@ fn test_batch_decode_combined_features() {
     let has_nan = output_host.iter().any(|x| x.is_nan());
     let has_inf = output_host.iter().any(|x| x.is_infinite());
 
-    assert!(!has_nan, "Combined features decode output contains NaN values");
-    assert!(!has_inf, "Combined features decode output contains Inf values");
+    assert!(
+        !has_nan,
+        "Combined features decode output contains NaN values"
+    );
+    assert!(
+        !has_inf,
+        "Combined features decode output contains Inf values"
+    );
 
     // Verify output is not all zeros
     let all_zero = output_host.iter().all(|x| x.to_f32() == 0.0);

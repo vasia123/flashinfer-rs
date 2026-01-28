@@ -191,7 +191,14 @@ impl Workspace {
         head_dim: u32,
         page_size: u32,
     ) -> (usize, usize) {
-        Self::batch_decode_sizes(batch_size, max_seq_len, num_heads, num_heads, head_dim, page_size)
+        Self::batch_decode_sizes(
+            batch_size,
+            max_seq_len,
+            num_heads,
+            num_heads,
+            head_dim,
+            page_size,
+        )
     }
 }
 
@@ -285,10 +292,10 @@ mod tests {
     #[test]
     fn test_workspace_sizes_batch_prefill() {
         let sizes = WorkspaceSizes::for_batch_prefill(
-            4,     // batch_size
-            1024,  // total_tokens
-            32,    // num_qo_heads
-            128,   // head_dim
+            4,    // batch_size
+            1024, // total_tokens
+            32,   // num_qo_heads
+            128,  // head_dim
         );
 
         // tmp = 1024 * 32 * 128 * 4 = 16777216

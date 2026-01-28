@@ -56,7 +56,9 @@ pub fn top_k_sampling(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let top_k_arr = top_k.map(|t| *t.device_ptr() as *const i32).unwrap_or(std::ptr::null());
+    let top_k_arr = top_k
+        .map(|t| *t.device_ptr() as *const i32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::top_k_sampling(
@@ -99,7 +101,9 @@ pub fn top_p_sampling(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let top_p_arr = top_p.map(|t| *t.device_ptr() as *const f32).unwrap_or(std::ptr::null());
+    let top_p_arr = top_p
+        .map(|t| *t.device_ptr() as *const f32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::top_p_sampling(
@@ -141,7 +145,9 @@ pub fn min_p_sampling(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let min_p_arr = min_p.map(|t| *t.device_ptr() as *const f32).unwrap_or(std::ptr::null());
+    let min_p_arr = min_p
+        .map(|t| *t.device_ptr() as *const f32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::min_p_sampling(
@@ -187,8 +193,12 @@ pub fn top_k_top_p_sampling(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let top_k_arr = top_k.map(|t| *t.device_ptr() as *const i32).unwrap_or(std::ptr::null());
-    let top_p_arr = top_p.map(|t| *t.device_ptr() as *const f32).unwrap_or(std::ptr::null());
+    let top_k_arr = top_k
+        .map(|t| *t.device_ptr() as *const i32)
+        .unwrap_or(std::ptr::null());
+    let top_p_arr = top_p
+        .map(|t| *t.device_ptr() as *const f32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::top_k_top_p_sampling(
@@ -241,7 +251,9 @@ pub fn softmax(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let temp_arr = temperature.map(|t| *t.device_ptr() as *const f32).unwrap_or(std::ptr::null());
+    let temp_arr = temperature
+        .map(|t| *t.device_ptr() as *const f32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::softmax(
@@ -280,7 +292,9 @@ pub fn top_p_renorm_probs(
     config: &SamplingConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    let top_p_arr = top_p.map(|t| *t.device_ptr() as *const f32).unwrap_or(std::ptr::null());
+    let top_p_arr = top_p
+        .map(|t| *t.device_ptr() as *const f32)
+        .unwrap_or(std::ptr::null());
 
     unsafe {
         crate::ffi::top_p_renorm_probs(

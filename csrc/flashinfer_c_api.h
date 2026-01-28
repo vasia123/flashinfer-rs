@@ -736,6 +736,77 @@ FlashInferStatus flashinfer_gemma_fused_add_rmsnorm(
  * ============================================================================ */
 
 /**
+ * Configuration for fused RoPE + Quantize + Append operation.
+ */
+typedef struct {
+    uint32_t num_qo_heads;       /* Number of query/output heads */
+    uint32_t num_kv_heads;       /* Number of key/value heads */
+    uint32_t rope_dim;           /* Dimension for RoPE (rotary part) */
+    uint32_t no_rope_dim;        /* Dimension for non-RoPE part (for MLA) */
+    uint32_t page_size;          /* Tokens per page */
+    float quant_scale_q;         /* Quantization scale for Q */
+    float quant_scale_kv;        /* Quantization scale for K/V */
+    int interleave;              /* Use interleaved RoPE format */
+    int enable_pdl;              /* Enable PDL (SM90+) */
+    FlashInferDType input_dtype; /* Input data type (FLOAT16 or BFLOAT16) */
+    FlashInferDType output_dtype;/* Output data type (FLOAT8_E4M3 or FLOAT8_E5M2) */
+    FlashInferKVLayout kv_layout;/* KV cache memory layout */
+} FlashInferRopeQuantAppendConfig;
+
+/**
+ * Fused RoPE + Quantize + Append to paged KV cache (requires SM89+).
+ *
+ * This operation combines:
+ * 1. Apply RoPE to Q_rope and K_rope tensors
+ * 2. Quantize all outputs to FP8
+ * 3. Append K/V to paged cache
+ *
+ * Used for FP8 inference in models with MLA or standard attention.
+ *
+ * @param q_rope_in       Query RoPE tensor [nnz, num_qo_heads, rope_dim]
+ * @param k_rope_in       Key RoPE tensor [nnz, num_kv_heads, rope_dim]
+ * @param q_nope_in       Query non-RoPE tensor [nnz, num_qo_heads, no_rope_dim]
+ * @param k_nope_in       Key non-RoPE tensor [nnz, num_kv_heads, no_rope_dim]
+ * @param v_in            Value tensor [nnz, num_kv_heads, head_dim]
+ * @param q_rope_out      Output query RoPE tensor (FP8) [nnz, num_qo_heads, rope_dim]
+ * @param q_nope_out      Output query non-RoPE tensor (FP8) [nnz, num_qo_heads, no_rope_dim]
+ * @param k_cache         Paged K cache (FP8)
+ * @param v_cache         Paged V cache (FP8)
+ * @param kv_indptr       Page offsets [batch_size + 1]
+ * @param kv_indices      Page indices [total_pages]
+ * @param kv_last_page_len Tokens in last page before append [batch_size]
+ * @param batch_indices   Batch index for each token [nnz]
+ * @param positions       Position for each token within its sequence [nnz]
+ * @param cos_sin_cache   Precomputed cos/sin cache [max_pos, rope_dim]
+ * @param pos_ids         Position IDs for RoPE [nnz]
+ * @param nnz             Total number of tokens
+ * @param config          Configuration for the operation
+ * @param stream          CUDA stream
+ * @return Status code
+ */
+FlashInferStatus flashinfer_rope_quant_append_paged_kv_cache(
+    const void* q_rope_in,
+    const void* k_rope_in,
+    const void* q_nope_in,
+    const void* k_nope_in,
+    const void* v_in,
+    void* q_rope_out,
+    void* q_nope_out,
+    void* k_cache,
+    void* v_cache,
+    const int32_t* kv_indptr,
+    const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    const int32_t* batch_indices,
+    const int32_t* positions,
+    const float* cos_sin_cache,
+    const int32_t* pos_ids,
+    uint32_t nnz,
+    const FlashInferRopeQuantAppendConfig* config,
+    void* stream
+);
+
+/**
  * Apply RoPE to Q and K tensors using batch indptr/offsets.
  *
  * @param q           Query tensor [total_tokens, num_qo_heads, head_dim]

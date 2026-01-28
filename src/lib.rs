@@ -33,8 +33,8 @@
 //! handler.run(&query, &kv_cache, &mut output)?;
 //! ```
 
-mod error;
 pub mod config;
+mod error;
 pub mod page_table;
 pub mod types;
 pub mod workspace;
@@ -57,10 +57,10 @@ pub mod ops;
 pub mod page;
 
 // Re-export core types
+pub use config::{AttentionConfig, NormConfig, RoPEConfig, SamplingConfig};
 pub use error::{FlashInferError, Result};
 pub use page_table::{PageTable, PageTableBuilder};
 pub use types::{Backend, DType, GpuFloat, HeadDim, KVLayout, MaskMode, PosEncodingMode};
-pub use config::{AttentionConfig, RoPEConfig, SamplingConfig, NormConfig};
 pub use workspace::WorkspaceSizes;
 
 #[cfg(feature = "cuda")]

@@ -42,9 +42,7 @@ impl Workspace {
 
     /// Get the workspace buffer pointer as a raw pointer.
     pub fn ptr(&self) -> Option<*mut u8> {
-        self.buffer
-            .as_ref()
-            .map(|b| *b.device_ptr() as *mut u8)
+        self.buffer.as_ref().map(|b| *b.device_ptr() as *mut u8)
     }
 
     /// Get the current workspace size.

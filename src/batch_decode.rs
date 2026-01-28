@@ -148,7 +148,7 @@ impl BatchDecodeHandler {
                 self.config.pos_encoding.into(),
                 self.config.logits_soft_cap.unwrap_or(0.0),
                 self.config.window_left.unwrap_or(-1), // -1 = full attention
-                false, // enable_cuda_graph
+                false,                                 // enable_cuda_graph
                 stream.stream as *mut std::ffi::c_void,
             )?
         };
@@ -189,9 +189,10 @@ impl BatchDecodeHandler {
         output: &mut CudaSlice<T>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let plan_data = self.plan_data.as_ref().ok_or_else(|| {
-            FlashInferError::invalid_config("must call plan() before forward()")
-        })?;
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
         unsafe {
             plan_data.plan.run(
@@ -224,9 +225,10 @@ impl BatchDecodeHandler {
         lse: &mut CudaSlice<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let plan_data = self.plan_data.as_ref().ok_or_else(|| {
-            FlashInferError::invalid_config("must call plan() before forward()")
-        })?;
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
         unsafe {
             plan_data.plan.run(

@@ -362,9 +362,9 @@ impl SamplingConfig {
     /// Creates a new sampling configuration with defaults.
     pub fn new() -> Self {
         Self {
-            top_k: 0,       // disabled
-            top_p: 1.0,     // disabled
-            min_p: 0.0,     // disabled
+            top_k: 0,   // disabled
+            top_p: 1.0, // disabled
+            min_p: 0.0, // disabled
             temperature: 1.0,
             deterministic: false,
             seed: 0,

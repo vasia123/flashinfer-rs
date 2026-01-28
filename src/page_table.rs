@@ -231,9 +231,7 @@ mod tests {
     fn test_page_table_builder() {
         let blocks: &[&[i32]] = &[&[0, 1, 2], &[3, 4]];
 
-        let table = PageTableBuilder::new(16)
-            .build_from_blocks(blocks)
-            .unwrap();
+        let table = PageTableBuilder::new(16).build_from_blocks(blocks).unwrap();
 
         assert_eq!(table.batch_size(), 2);
         assert_eq!(table.seq_blocks(0), &[0, 1, 2]);

@@ -197,9 +197,10 @@ impl BatchPrefillHandler {
         output: &mut CudaSlice<T>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let plan_data = self.plan_data.as_ref().ok_or_else(|| {
-            FlashInferError::invalid_config("must call plan() before forward()")
-        })?;
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
         unsafe {
             plan_data.plan.run(
@@ -230,9 +231,10 @@ impl BatchPrefillHandler {
         lse: &mut CudaSlice<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let plan_data = self.plan_data.as_ref().ok_or_else(|| {
-            FlashInferError::invalid_config("must call plan() before forward()")
-        })?;
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
         unsafe {
             plan_data.plan.run(
