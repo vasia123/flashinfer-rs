@@ -217,12 +217,38 @@ FlashInferStatus flashinfer_softmax(
         return FLASHINFER_INVALID_ARGUMENT;
     }
 
+    // FlashInfer OnlineSoftmax only supports float32
+    if (dtype != FLASHINFER_DTYPE_FLOAT32) {
+        set_error("softmax only supports float32");
+        return FLASHINFER_UNSUPPORTED;
+    }
+
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
-    // FlashInfer's OnlineSoftmax function - need to check exact API
-    // For now, return UNSUPPORTED as the exact API needs investigation
-    set_error("softmax not directly exposed by FlashInfer - use sampling functions instead");
-    return FLASHINFER_UNSUPPORTED;
+    // NOTE: FlashInfer's OnlineSoftmax has an optimized multi-pass path for
+    // large vocabularies (vocab_size >= 24576) with small batches (batch_size <= 128)
+    // that requires a workspace buffer. Since our C API doesn't expose workspace
+    // for softmax, we pass nullptr which forces the single-block path.
+    // This is still efficient for most use cases, but the caller should allocate
+    // workspace for optimal performance with large vocabularies.
+    //
+    // Required workspace size for large vocab path:
+    //   batch_size * ceil_div(vocab_size, 8192) * sizeof(PartialSoftmaxResult)
+    //   where PartialSoftmaxResult is 8 bytes (2 floats: max_val, denominator)
+    cudaError_t err = flashinfer::sampling::OnlineSoftmax<float>(
+        const_cast<float*>(static_cast<const float*>(logits)),
+        static_cast<float*>(probs),
+        batch_size,
+        vocab_size,
+        const_cast<float*>(temperature_arr),
+        temp_val,
+        nullptr,  // workspace_buffer - nullptr triggers single-block path
+        0,        // workspace_buffer_size_in_bytes
+        false,    // enable_pdl - disabled since we don't have workspace for PDL either
+        cuda_stream
+    );
+
+    return from_cuda_error(err);
 }
 
 FlashInferStatus flashinfer_top_k_mask_logits(

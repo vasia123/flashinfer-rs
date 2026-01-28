@@ -9,6 +9,9 @@
 
 #include "flashinfer_common.h"
 
+// FP8 types for quantization (requires CUDA 11.8+)
+#include <cuda_fp8.h>
+
 #include <flashinfer/norm.cuh>
 
 using namespace flashinfer_rs;
@@ -89,8 +92,95 @@ FlashInferStatus flashinfer_rmsnorm_quant(
     void* stream
 ) {
     clear_error();
-    set_error("FP8 quantized RMSNorm requires SM89+ (Ada Lovelace or newer)");
+
+    if (!input || !weight || !output || !scale) {
+        set_error("Null pointer passed to rmsnorm_quant");
+        return FLASHINFER_INVALID_ARGUMENT;
+    }
+
+    // Runtime SM capability check - FP8 requires SM89+
+    int device;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        return from_cuda_error(err);
+    }
+
+    int major, minor;
+    err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (err != cudaSuccess) {
+        return from_cuda_error(err);
+    }
+    err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (err != cudaSuccess) {
+        return from_cuda_error(err);
+    }
+
+    int sm_version = major * 10 + minor;
+    if (sm_version < 89) {
+        set_error("FP8 quantized RMSNorm requires SM89+ (Ada Lovelace or newer). "
+                  "Current device: SM" + std::to_string(sm_version));
+        return FLASHINFER_UNSUPPORTED;
+    }
+
+    // Validate output dtype is FP8
+    if (output_dtype != FLASHINFER_DTYPE_FLOAT8_E4M3 &&
+        output_dtype != FLASHINFER_DTYPE_FLOAT8_E5M2) {
+        set_error("rmsnorm_quant output must be FP8 (E4M3 or E5M2)");
+        return FLASHINFER_INVALID_ARGUMENT;
+    }
+
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+    // Read scale value from pointer (user provides pre-computed quantization scale)
+    float scale_val = *scale;
+
+    // Contiguous layout stride
+    uint32_t stride = hidden_dim;
+
+    // Dispatch by input dtype and output dtype
+    // NOTE: Compilation for SM89 targets requires CUDA 11.8+ with FP8 support.
+    // This code will compile but only run on SM89+ hardware.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) || !defined(__CUDA_ARCH__)
+    // FP8 types are available in cuda_fp8.h (CUDA 11.8+)
+    #define DISPATCH_FP8_QUANT(InputType, OutputType) \
+        err = flashinfer::norm::RMSNormQuant( \
+            const_cast<InputType*>(static_cast<const InputType*>(input)), \
+            const_cast<InputType*>(static_cast<const InputType*>(weight)), \
+            static_cast<OutputType*>(output), \
+            batch_size, \
+            hidden_dim, \
+            stride, \
+            stride, \
+            scale_val, \
+            eps, \
+            false, \
+            cuda_stream \
+        )
+
+    if (input_dtype == FLASHINFER_DTYPE_FLOAT16) {
+        if (output_dtype == FLASHINFER_DTYPE_FLOAT8_E4M3) {
+            DISPATCH_FP8_QUANT(__half, __nv_fp8_e4m3);
+        } else {
+            DISPATCH_FP8_QUANT(__half, __nv_fp8_e5m2);
+        }
+    } else if (input_dtype == FLASHINFER_DTYPE_BFLOAT16) {
+        if (output_dtype == FLASHINFER_DTYPE_FLOAT8_E4M3) {
+            DISPATCH_FP8_QUANT(__nv_bfloat16, __nv_fp8_e4m3);
+        } else {
+            DISPATCH_FP8_QUANT(__nv_bfloat16, __nv_fp8_e5m2);
+        }
+    } else {
+        set_error("Unsupported input dtype for rmsnorm_quant (must be FP16 or BF16)");
+        return FLASHINFER_UNSUPPORTED;
+    }
+
+    #undef DISPATCH_FP8_QUANT
+#else
+    set_error("FP8 quantized RMSNorm compiled without SM89+ support");
     return FLASHINFER_UNSUPPORTED;
+#endif
+
+    return from_cuda_error(err);
 }
 
 FlashInferStatus flashinfer_fused_add_rmsnorm(
