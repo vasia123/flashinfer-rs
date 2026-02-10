@@ -55,6 +55,10 @@ pub mod batch_prefill;
 pub mod ops;
 
 pub mod mla;
+
+#[cfg(feature = "cuda")]
+pub mod mla_handler;
+
 pub mod page;
 
 // Re-export core types
@@ -80,6 +84,9 @@ pub use page::PagedKVCache;
 
 // MLA (DeepSeek) support
 pub use mla::{MLAConfig, MLAKeyShape, MLAQueryShape};
+
+#[cfg(feature = "cuda")]
+pub use mla_handler::MLAHandler;
 
 // Backwards compatibility re-exports
 pub use types::DType as DataType;

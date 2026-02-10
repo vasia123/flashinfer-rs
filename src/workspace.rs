@@ -262,6 +262,33 @@ impl WorkspaceSizes {
         }
     }
 
+    /// Creates workspace sizes for MLA (Multi-head Latent Attention).
+    ///
+    /// Conservative estimate for DeepSeek v2/v3 MLA attention.
+    pub fn for_mla(
+        batch_size: u32,
+        max_seq_len: u32,
+        num_heads: u32,
+        head_dim_ckv: u32,
+        page_size: u32,
+    ) -> Self {
+        // Float: tmp_v for split-k + tmp_s for softmax + padding
+        let tmp_v_size = batch_size as usize * num_heads as usize * head_dim_ckv as usize * 4;
+        let tmp_s_size = batch_size as usize * num_heads as usize * 4;
+        let float_size = tmp_v_size + tmp_s_size + 8192;
+
+        // Int: partition info + page indices + padding
+        let max_num_pages = max_seq_len.div_ceil(page_size);
+        let partition_info_size = batch_size as usize * 2 * 4;
+        let page_indices_size = batch_size as usize * max_num_pages as usize * 4;
+        let int_size = partition_info_size + page_indices_size + 4096;
+
+        Self {
+            float_size,
+            int_size,
+        }
+    }
+
     /// Returns total size (float + int).
     #[inline]
     pub fn total(&self) -> usize {
@@ -306,6 +333,26 @@ mod tests {
 
         // tmp = 1024 * 32 * 128 * 4 = 16777216
         assert!(sizes.float_size >= 1024 * 32 * 128 * 4);
+    }
+
+    #[test]
+    fn test_workspace_sizes_mla() {
+        let sizes = WorkspaceSizes::for_mla(
+            4,    // batch_size
+            2048, // max_seq_len
+            128,  // num_heads (DeepSeek)
+            512,  // head_dim_ckv
+            16,   // page_size
+        );
+
+        // Float: tmp_v = 4 * 128 * 512 * 4 = 1048576
+        //        tmp_s = 4 * 128 * 4 = 2048
+        assert!(sizes.float_size >= 4 * 128 * 512 * 4 + 4 * 128 * 4);
+
+        // Int: max_pages = 2048/16 = 128
+        //      partition = 4 * 2 * 4 = 32
+        //      page_indices = 4 * 128 * 4 = 2048
+        assert!(sizes.int_size >= 32 + 2048);
     }
 
     #[test]
