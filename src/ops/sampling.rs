@@ -12,7 +12,7 @@
 //! Convert your probabilities to f32 before calling these functions.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 use crate::config::SamplingConfig;
 use crate::Result;
@@ -57,13 +57,20 @@ pub fn top_k_sampling(
     stream: &CudaStream,
 ) -> Result<()> {
     let top_k_arr = top_k
-        .map(|t| *t.device_ptr() as *const i32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const i32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::top_k_sampling(
-            *probs.device_ptr() as *const f32,
-            *output.device_ptr() as *mut i32,
+            probs_ptr as *const f32,
+            output_ptr as *mut i32,
             top_k_arr,
             config.top_k,
             batch_size,
@@ -71,7 +78,7 @@ pub fn top_k_sampling(
             config.deterministic,
             config.seed,
             config.offset,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }
@@ -102,13 +109,20 @@ pub fn top_p_sampling(
     stream: &CudaStream,
 ) -> Result<()> {
     let top_p_arr = top_p
-        .map(|t| *t.device_ptr() as *const f32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::top_p_sampling(
-            *probs.device_ptr() as *const f32,
-            *output.device_ptr() as *mut i32,
+            probs_ptr as *const f32,
+            output_ptr as *mut i32,
             top_p_arr,
             config.top_p,
             batch_size,
@@ -116,7 +130,7 @@ pub fn top_p_sampling(
             config.deterministic,
             config.seed,
             config.offset,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }
@@ -146,13 +160,20 @@ pub fn min_p_sampling(
     stream: &CudaStream,
 ) -> Result<()> {
     let min_p_arr = min_p
-        .map(|t| *t.device_ptr() as *const f32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::min_p_sampling(
-            *probs.device_ptr() as *const f32,
-            *output.device_ptr() as *mut i32,
+            probs_ptr as *const f32,
+            output_ptr as *mut i32,
             min_p_arr,
             config.min_p,
             batch_size,
@@ -160,7 +181,7 @@ pub fn min_p_sampling(
             config.deterministic,
             config.seed,
             config.offset,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }
@@ -194,16 +215,26 @@ pub fn top_k_top_p_sampling(
     stream: &CudaStream,
 ) -> Result<()> {
     let top_k_arr = top_k
-        .map(|t| *t.device_ptr() as *const i32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const i32
+        })
         .unwrap_or(std::ptr::null());
     let top_p_arr = top_p
-        .map(|t| *t.device_ptr() as *const f32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::top_k_top_p_sampling(
-            *probs.device_ptr() as *const f32,
-            *output.device_ptr() as *mut i32,
+            probs_ptr as *const f32,
+            output_ptr as *mut i32,
             top_k_arr,
             top_p_arr,
             config.top_k,
@@ -213,7 +244,7 @@ pub fn top_k_top_p_sampling(
             config.deterministic,
             config.seed,
             config.offset,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }
@@ -252,18 +283,25 @@ pub fn softmax(
     stream: &CudaStream,
 ) -> Result<()> {
     let temp_arr = temperature
-        .map(|t| *t.device_ptr() as *const f32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (logits_ptr, _logits_guard) = logits.device_ptr(stream);
+    let (probs_ptr, _probs_guard) = probs.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::softmax(
-            *logits.device_ptr() as *const f32,
-            *probs.device_ptr() as *mut f32,
+            logits_ptr as *const f32,
+            probs_ptr as *mut f32,
             temp_arr,
             config.temperature,
             batch_size,
             vocab_size,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }
@@ -293,18 +331,25 @@ pub fn top_p_renorm_probs(
     stream: &CudaStream,
 ) -> Result<()> {
     let top_p_arr = top_p
-        .map(|t| *t.device_ptr() as *const f32)
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
         .unwrap_or(std::ptr::null());
+
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (renormed_ptr, _renormed_guard) = renormed_probs.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
     unsafe {
         crate::ffi::top_p_renorm_probs(
-            *probs.device_ptr() as *const f32,
-            *renormed_probs.device_ptr() as *mut f32,
+            probs_ptr as *const f32,
+            renormed_ptr as *mut f32,
             top_p_arr,
             config.top_p,
             batch_size,
             vocab_size,
-            stream.stream as *mut std::ffi::c_void,
+            cu_stream,
         )
     }
 }

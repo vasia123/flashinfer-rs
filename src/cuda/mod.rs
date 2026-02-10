@@ -3,7 +3,7 @@
 //! This module provides CUDA memory management for FlashInfer operations.
 
 use crate::Result;
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+use cudarc::driver::{CudaStream, CudaSlice, DevicePtr};
 use std::sync::Arc;
 
 /// CUDA workspace buffer for FlashInfer operations.
@@ -11,16 +11,16 @@ use std::sync::Arc;
 /// FlashInfer kernels require workspace memory for intermediate results.
 /// This struct manages that memory efficiently.
 pub struct Workspace {
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
     buffer: Option<CudaSlice<u8>>,
     size: usize,
 }
 
 impl Workspace {
-    /// Create a new workspace on the given device.
-    pub fn new(device: Arc<CudaDevice>) -> Self {
+    /// Create a new workspace on the given stream.
+    pub fn new(stream: Arc<CudaStream>) -> Self {
         Self {
-            device,
+            stream,
             buffer: None,
             size: 0,
         }
@@ -34,7 +34,7 @@ impl Workspace {
 
         // Allocate with some extra room to avoid frequent reallocations
         let new_size = required_size.next_power_of_two();
-        self.buffer = Some(self.device.alloc_zeros::<u8>(new_size)?);
+        self.buffer = Some(self.stream.alloc_zeros::<u8>(new_size)?);
         self.size = new_size;
 
         Ok(())
@@ -42,7 +42,10 @@ impl Workspace {
 
     /// Get the workspace buffer pointer as a raw pointer.
     pub fn ptr(&self) -> Option<*mut u8> {
-        self.buffer.as_ref().map(|b| *b.device_ptr() as *mut u8)
+        self.buffer.as_ref().map(|b| {
+            let (ptr, _guard) = b.device_ptr(&self.stream);
+            ptr as *mut u8
+        })
     }
 
     /// Get the current workspace size.
@@ -50,9 +53,9 @@ impl Workspace {
         self.size
     }
 
-    /// Get the CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Get the CUDA stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 }
 

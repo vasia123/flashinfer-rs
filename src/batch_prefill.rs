@@ -8,7 +8,7 @@ use crate::page_table::PageTable;
 use crate::types::GpuFloat;
 use crate::workspace::Workspace;
 use crate::{ffi, AttentionConfig, FlashInferError, KVLayout, MaskMode, Result};
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaStream, CudaSlice, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
 
 /// Handler for batched prefill attention with paged KV cache.
@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```ignore
-/// let handler = BatchPrefillHandler::new(device, config)?;
+/// let handler = BatchPrefillHandler::new(stream, config)?;
 ///
 /// // Plan the computation
 /// handler.plan::<half::f16>(qo_indptr, kv_lengths, page_table, &stream)?;
@@ -28,7 +28,7 @@ use std::sync::Arc;
 /// handler.forward(&query, &kv_cache_k, &kv_cache_v, &mut output, &stream)?;
 /// ```
 pub struct BatchPrefillHandler {
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
     config: AttentionConfig,
     workspace: Workspace,
     // Cached plan data (None until plan() is called)
@@ -57,11 +57,11 @@ struct PrefillPlanData {
 
 impl BatchPrefillHandler {
     /// Create a new batch prefill handler.
-    pub fn new(device: Arc<CudaDevice>, config: AttentionConfig) -> Result<Self> {
-        let workspace = Workspace::new(&device)?;
+    pub fn new(stream: Arc<CudaStream>, config: AttentionConfig) -> Result<Self> {
+        let workspace = Workspace::new(&stream)?;
 
         Ok(Self {
-            device,
+            stream,
             config,
             workspace,
             plan_data: None,
@@ -117,10 +117,10 @@ impl BatchPrefillHandler {
             page_table.compute_kv_last_page_len(kv_lengths, self.config.page_size as usize);
 
         // Upload arrays to GPU
-        let qo_indptr_d = self.device.htod_sync_copy(qo_indptr)?;
-        let kv_indptr_d = self.device.htod_sync_copy(&kv_indptr)?;
-        let kv_indices_d = self.device.htod_sync_copy(&kv_indices)?;
-        let kv_last_page_len_d = self.device.htod_sync_copy(&kv_last_page_len)?;
+        let qo_indptr_d = self.stream.memcpy_stod(qo_indptr)?;
+        let kv_indptr_d = self.stream.memcpy_stod(&kv_indptr)?;
+        let kv_indices_d = self.stream.memcpy_stod(&kv_indices)?;
+        let kv_last_page_len_d = self.stream.memcpy_stod(&kv_last_page_len)?;
 
         // Ensure workspace is large enough
         let (float_size, int_size) = Workspace::batch_prefill_sizes(
@@ -136,30 +136,34 @@ impl BatchPrefillHandler {
         // Determine causal mode
         let causal = matches!(self.config.mask_mode, MaskMode::Causal);
 
-        // Create FFI plan
-        let plan = unsafe {
-            ffi::BatchPrefillPlan::new(
-                self.workspace.float_ptr() as *mut std::ffi::c_void,
-                self.workspace.float_size(),
-                self.workspace.int_ptr() as *mut std::ffi::c_void,
-                self.workspace.int_size(),
-                std::ptr::null_mut(), // page_locked_workspace (optional)
-                0,                    // page_locked_size
-                *qo_indptr_d.device_ptr() as *const i32,
-                *kv_indptr_d.device_ptr() as *const i32,
-                batch_size as i32,
-                self.config.num_qo_heads as i32,
-                self.config.num_kv_heads as i32,
-                self.config.head_dim_qk as i32,
-                self.config.page_size as i32,
-                T::DTYPE.into(),
-                self.config.pos_encoding.into(),
-                self.config.logits_soft_cap.unwrap_or(0.0),
-                self.config.window_left.unwrap_or(-1), // -1 = full attention
-                causal,
-                false, // enable_cuda_graph
-                stream.stream as *mut std::ffi::c_void,
-            )?
+        // Create FFI plan — scope guards so they drop before we move the slices
+        let plan = {
+            let (qo_indptr_ptr, _qo_guard) = qo_indptr_d.device_ptr(stream);
+            let (kv_indptr_ptr, _kv_guard) = kv_indptr_d.device_ptr(stream);
+            unsafe {
+                ffi::BatchPrefillPlan::new(
+                    self.workspace.float_ptr() as *mut std::ffi::c_void,
+                    self.workspace.float_size(),
+                    self.workspace.int_ptr() as *mut std::ffi::c_void,
+                    self.workspace.int_size(),
+                    std::ptr::null_mut(), // page_locked_workspace (optional)
+                    0,                    // page_locked_size
+                    qo_indptr_ptr as *const i32,
+                    kv_indptr_ptr as *const i32,
+                    batch_size as i32,
+                    self.config.num_qo_heads as i32,
+                    self.config.num_kv_heads as i32,
+                    self.config.head_dim_qk as i32,
+                    self.config.page_size as i32,
+                    T::DTYPE.into(),
+                    self.config.pos_encoding.into(),
+                    self.config.logits_soft_cap.unwrap_or(0.0),
+                    self.config.window_left.unwrap_or(-1), // -1 = full attention
+                    causal,
+                    false, // enable_cuda_graph
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )?
+            }
         };
 
         self.plan_data = Some(PrefillPlanData {
@@ -202,19 +206,28 @@ impl BatchPrefillHandler {
             .as_ref()
             .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (kv_indptr_ptr, _ki_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (kv_indices_ptr, _kix_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (qo_indptr_ptr, _qo_guard) = plan_data.qo_indptr_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+
         unsafe {
             plan_data.plan.run(
-                *query.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_k.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_v.device_ptr() as *const std::ffi::c_void,
-                *plan_data.kv_indptr_d.device_ptr() as *const i32,
-                *plan_data.kv_indices_d.device_ptr() as *const i32,
-                *plan_data.kv_last_page_len_d.device_ptr() as *const i32,
-                *plan_data.qo_indptr_d.device_ptr() as *const i32,
-                *output.device_ptr() as *mut std::ffi::c_void,
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                kv_indptr_ptr as *const i32,
+                kv_indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                qo_indptr_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
                 std::ptr::null_mut(), // lse (optional)
                 plan_data.kv_layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
 
@@ -236,19 +249,29 @@ impl BatchPrefillHandler {
             .as_ref()
             .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (kv_indptr_ptr, _ki_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (kv_indices_ptr, _kix_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (qo_indptr_ptr, _qo_guard) = plan_data.qo_indptr_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+        let (lse_ptr, _lse_guard) = lse.device_ptr_mut(stream);
+
         unsafe {
             plan_data.plan.run(
-                *query.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_k.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_v.device_ptr() as *const std::ffi::c_void,
-                *plan_data.kv_indptr_d.device_ptr() as *const i32,
-                *plan_data.kv_indices_d.device_ptr() as *const i32,
-                *plan_data.kv_last_page_len_d.device_ptr() as *const i32,
-                *plan_data.qo_indptr_d.device_ptr() as *const i32,
-                *output.device_ptr() as *mut std::ffi::c_void,
-                *lse.device_ptr() as *mut f32,
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                kv_indptr_ptr as *const i32,
+                kv_indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                qo_indptr_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
+                lse_ptr as *mut f32,
                 plan_data.kv_layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
 
@@ -290,25 +313,34 @@ impl BatchPrefillHandler {
         self.forward(query, kv_cache_k, kv_cache_v, output, stream)?;
 
         // Step 2: Append new KV to cache
-        let append_indptr_d = self.device.htod_sync_copy(append_indptr)?;
+        let append_indptr_d = self.stream.memcpy_stod(append_indptr)?;
+
+        let (k_ptr, _k_guard) = key.device_ptr(stream);
+        let (v_ptr, _v_guard) = value.device_ptr(stream);
+        let (kck_ptr, _kck_guard) = kv_cache_k.device_ptr_mut(stream);
+        let (kcv_ptr, _kcv_guard) = kv_cache_v.device_ptr_mut(stream);
+        let (kv_indptr_ptr, _ki_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (kv_indices_ptr, _kix_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (append_ptr, _ap_guard) = append_indptr_d.device_ptr(stream);
 
         unsafe {
             ffi::append_paged_kv_cache(
-                *key.device_ptr() as *const std::ffi::c_void,
-                *value.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_k.device_ptr() as *mut std::ffi::c_void,
-                *kv_cache_v.device_ptr() as *mut std::ffi::c_void,
-                *plan_data.kv_indptr_d.device_ptr() as *const i32,
-                *plan_data.kv_indices_d.device_ptr() as *const i32,
-                *plan_data.kv_last_page_len_d.device_ptr() as *const i32,
-                *append_indptr_d.device_ptr() as *const i32,
+                k_ptr as *const std::ffi::c_void,
+                v_ptr as *const std::ffi::c_void,
+                kck_ptr as *mut std::ffi::c_void,
+                kcv_ptr as *mut std::ffi::c_void,
+                kv_indptr_ptr as *const i32,
+                kv_indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                append_ptr as *const i32,
                 plan_data.batch_size as i32,
                 self.config.num_kv_heads as i32,
                 self.config.head_dim_qk as i32,
                 self.config.page_size as i32,
                 T::DTYPE.into(),
                 plan_data.kv_layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
 
@@ -329,13 +361,15 @@ impl BatchPrefillHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cudarc::driver::CudaContext;
 
     #[test]
     #[ignore]
     fn test_batch_prefill_handler_creation() {
-        let device = CudaDevice::new(0).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let config = AttentionConfig::new(32, 8, 128);
-        let handler = BatchPrefillHandler::new(device, config).unwrap();
+        let handler = BatchPrefillHandler::new(stream, config).unwrap();
 
         assert_eq!(handler.config().num_qo_heads, 32);
         assert!(!handler.is_planned());

@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 const CUDA_MODULES: &[&str] = &[
     "flashinfer_decode.cu",     // Batch decode attention (8 variants) - slowest
     "flashinfer_prefill.cu",    // Batch prefill attention (8 variants) - slowest
-    "flashinfer_mla.cu",        // DeepSeek MLA attention (fixed dims)
+    // TODO: flashinfer_mla.cu disabled — FlashInfer headers lack mla::MLAParams.
+    // Re-enable when MLA kernel support is added (Этап 0.5).
     "flashinfer_norm.cu",       // RMSNorm, LayerNorm, etc.
     "flashinfer_sampling.cu",   // top_k, top_p, etc.
     "flashinfer_rope.cu",       // Rotary position embedding

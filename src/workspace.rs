@@ -5,14 +5,17 @@
 //! these workspaces.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+use cudarc::driver::{CudaStream, CudaSlice, DevicePtr};
 
+#[cfg(feature = "cuda")]
 use crate::Result;
 
 /// Default float workspace size (16 MB).
+#[cfg(feature = "cuda")]
 const DEFAULT_FLOAT_WORKSPACE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default int workspace size (8 MB).
+#[cfg(feature = "cuda")]
 const DEFAULT_INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024;
 
 /// GPU workspace for FlashInfer operations.
@@ -26,11 +29,12 @@ const DEFAULT_INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024;
 /// ```ignore
 /// use flashinfer_rs::workspace::Workspace;
 ///
-/// let device = CudaDevice::new(0)?;
-/// let workspace = Workspace::new(&device)?;
+/// let ctx = CudaContext::new(0)?;
+/// let stream = ctx.default_stream();
+/// let workspace = Workspace::new(&stream)?;
 ///
 /// // Or with custom sizes:
-/// let workspace = Workspace::with_sizes(&device, 32 * 1024 * 1024, 16 * 1024 * 1024)?;
+/// let workspace = Workspace::with_sizes(&stream, 32 * 1024 * 1024, 16 * 1024 * 1024)?;
 /// ```
 #[cfg(feature = "cuda")]
 pub struct Workspace {
@@ -42,16 +46,16 @@ pub struct Workspace {
     float_buffer_size: usize,
     /// Int buffer size.
     int_buffer_size: usize,
-    /// Device reference.
-    device: std::sync::Arc<CudaDevice>,
+    /// Stream reference.
+    stream: std::sync::Arc<CudaStream>,
 }
 
 #[cfg(feature = "cuda")]
 impl Workspace {
     /// Creates a new workspace with default sizes.
-    pub fn new(device: &std::sync::Arc<CudaDevice>) -> Result<Self> {
+    pub fn new(stream: &std::sync::Arc<CudaStream>) -> Result<Self> {
         Self::with_sizes(
-            device,
+            stream,
             DEFAULT_FLOAT_WORKSPACE_SIZE,
             DEFAULT_INT_WORKSPACE_SIZE,
         )
@@ -61,23 +65,23 @@ impl Workspace {
     ///
     /// # Arguments
     ///
-    /// * `device` - CUDA device
+    /// * `stream` - CUDA stream for allocation
     /// * `float_size` - Size of float workspace in bytes
     /// * `int_size` - Size of int workspace in bytes
     pub fn with_sizes(
-        device: &std::sync::Arc<CudaDevice>,
+        stream: &std::sync::Arc<CudaStream>,
         float_size: usize,
         int_size: usize,
     ) -> Result<Self> {
-        let float_buffer = device.alloc_zeros::<u8>(float_size)?;
-        let int_buffer = device.alloc_zeros::<u8>(int_size)?;
+        let float_buffer = stream.alloc_zeros::<u8>(float_size)?;
+        let int_buffer = stream.alloc_zeros::<u8>(int_size)?;
 
         Ok(Self {
             float_buffer,
             int_buffer,
             float_buffer_size: float_size,
             int_buffer_size: int_size,
-            device: device.clone(),
+            stream: stream.clone(),
         })
     }
 
@@ -86,11 +90,11 @@ impl Workspace {
     /// If the current buffers are too small, they will be reallocated.
     pub fn ensure_sizes(&mut self, float_size: usize, int_size: usize) -> Result<()> {
         if self.float_buffer_size < float_size {
-            self.float_buffer = self.device.alloc_zeros::<u8>(float_size)?;
+            self.float_buffer = self.stream.alloc_zeros::<u8>(float_size)?;
             self.float_buffer_size = float_size;
         }
         if self.int_buffer_size < int_size {
-            self.int_buffer = self.device.alloc_zeros::<u8>(int_size)?;
+            self.int_buffer = self.stream.alloc_zeros::<u8>(int_size)?;
             self.int_buffer_size = int_size;
         }
         Ok(())
@@ -99,13 +103,15 @@ impl Workspace {
     /// Returns the float workspace buffer pointer.
     #[inline]
     pub fn float_ptr(&self) -> *mut u8 {
-        *self.float_buffer.device_ptr() as *mut u8
+        let (ptr, _guard) = self.float_buffer.device_ptr(&self.stream);
+        ptr as *mut u8
     }
 
     /// Returns the int workspace buffer pointer.
     #[inline]
     pub fn int_ptr(&self) -> *mut u8 {
-        *self.int_buffer.device_ptr() as *mut u8
+        let (ptr, _guard) = self.int_buffer.device_ptr(&self.stream);
+        ptr as *mut u8
     }
 
     /// Returns the float workspace size in bytes.
@@ -120,10 +126,10 @@ impl Workspace {
         self.int_buffer_size
     }
 
-    /// Returns a reference to the device.
+    /// Returns a reference to the stream.
     #[inline]
-    pub fn device(&self) -> &std::sync::Arc<CudaDevice> {
-        &self.device
+    pub fn stream(&self) -> &std::sync::Arc<CudaStream> {
+        &self.stream
     }
 
     /// Computes required workspace sizes for batch decode operations.
@@ -154,7 +160,7 @@ impl Workspace {
         let float_size = tmp_v_size + tmp_s_size + 4096; // padding
 
         // Int workspace: partition info, page indices
-        let max_num_pages = (max_seq_len + page_size - 1) / page_size;
+        let max_num_pages = max_seq_len.div_ceil(page_size);
         let partition_info_size = batch_size as usize * num_kv_heads as usize * 2 * 4; // int32
         let page_indices_size = batch_size as usize * max_num_pages as usize * 4; // int32
         let int_size = partition_info_size + page_indices_size + 4096; // padding
@@ -225,7 +231,7 @@ impl WorkspaceSizes {
         let tmp_s_size = batch_size as usize * num_qo_heads as usize * 4;
         let float_size = tmp_v_size + tmp_s_size + 4096;
 
-        let max_num_pages = (max_seq_len + page_size - 1) / page_size;
+        let max_num_pages = max_seq_len.div_ceil(page_size);
         let partition_info_size = batch_size as usize * num_kv_heads as usize * 2 * 4;
         let page_indices_size = batch_size as usize * max_num_pages as usize * 4;
         let int_size = partition_info_size + page_indices_size + 4096;

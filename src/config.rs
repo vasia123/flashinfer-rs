@@ -208,7 +208,7 @@ impl AttentionConfig {
         if self.num_kv_heads == 0 {
             return Err("num_kv_heads must be positive".to_string());
         }
-        if self.num_qo_heads % self.num_kv_heads != 0 {
+        if !self.num_qo_heads.is_multiple_of(self.num_kv_heads) {
             return Err("num_qo_heads must be divisible by num_kv_heads".to_string());
         }
         if self.head_dim_qk == 0 || self.head_dim_vo == 0 {
@@ -304,7 +304,7 @@ impl RoPEConfig {
         if self.rotary_dim == 0 {
             return Err("rotary_dim must be positive".to_string());
         }
-        if self.rotary_dim % 2 != 0 {
+        if !self.rotary_dim.is_multiple_of(2) {
             return Err("rotary_dim must be even".to_string());
         }
         if self.theta <= 0.0 {

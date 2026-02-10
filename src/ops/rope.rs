@@ -5,7 +5,7 @@
 //! to encode positional information.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 use crate::config::RoPEConfig;
 #[cfg(feature = "cuda")]
@@ -73,21 +73,28 @@ pub fn apply_rope<T: GpuFloat>(
 ) -> Result<()> {
     let ffi_config = to_ffi_config(config);
 
+    let (q_ptr, _q_guard) = q.device_ptr(stream);
+    let (k_ptr, _k_guard) = k.device_ptr(stream);
+    let (qo_ptr, _qo_guard) = q_out.device_ptr_mut(stream);
+    let (ko_ptr, _ko_guard) = k_out.device_ptr_mut(stream);
+    let (indptr_ptr, _ind_guard) = indptr.device_ptr(stream);
+    let (offsets_ptr, _off_guard) = offsets.device_ptr(stream);
+
     unsafe {
         crate::ffi::apply_rope(
-            *q.device_ptr() as *const std::ffi::c_void,
-            *k.device_ptr() as *const std::ffi::c_void,
-            *q_out.device_ptr() as *mut std::ffi::c_void,
-            *k_out.device_ptr() as *mut std::ffi::c_void,
-            *indptr.device_ptr() as *const i32,
-            *offsets.device_ptr() as *const i32,
+            q_ptr as *const std::ffi::c_void,
+            k_ptr as *const std::ffi::c_void,
+            qo_ptr as *mut std::ffi::c_void,
+            ko_ptr as *mut std::ffi::c_void,
+            indptr_ptr as *const i32,
+            offsets_ptr as *const i32,
             batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim,
             &ffi_config,
             T::DTYPE.into(),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
 }
@@ -111,19 +118,24 @@ pub fn apply_rope_inplace<T: GpuFloat>(
 ) -> Result<()> {
     let ffi_config = to_ffi_config(config);
 
+    let (q_ptr, _q_guard) = q.device_ptr_mut(stream);
+    let (k_ptr, _k_guard) = k.device_ptr_mut(stream);
+    let (indptr_ptr, _ind_guard) = indptr.device_ptr(stream);
+    let (offsets_ptr, _off_guard) = offsets.device_ptr(stream);
+
     unsafe {
         crate::ffi::apply_rope_inplace(
-            *q.device_ptr() as *mut std::ffi::c_void,
-            *k.device_ptr() as *mut std::ffi::c_void,
-            *indptr.device_ptr() as *const i32,
-            *offsets.device_ptr() as *const i32,
+            q_ptr as *mut std::ffi::c_void,
+            k_ptr as *mut std::ffi::c_void,
+            indptr_ptr as *const i32,
+            offsets_ptr as *const i32,
             batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim,
             &ffi_config,
             T::DTYPE.into(),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
 }
@@ -163,20 +175,26 @@ pub fn apply_rope_pos_ids<T: GpuFloat>(
 ) -> Result<()> {
     let ffi_config = to_ffi_config(config);
 
+    let (q_ptr, _q_guard) = q.device_ptr(stream);
+    let (k_ptr, _k_guard) = k.device_ptr(stream);
+    let (qo_ptr, _qo_guard) = q_out.device_ptr_mut(stream);
+    let (ko_ptr, _ko_guard) = k_out.device_ptr_mut(stream);
+    let (pos_ptr, _pos_guard) = pos_ids.device_ptr(stream);
+
     unsafe {
         crate::ffi::apply_rope_pos_ids(
-            *q.device_ptr() as *const std::ffi::c_void,
-            *k.device_ptr() as *const std::ffi::c_void,
-            *q_out.device_ptr() as *mut std::ffi::c_void,
-            *k_out.device_ptr() as *mut std::ffi::c_void,
-            *pos_ids.device_ptr() as *const i32,
+            q_ptr as *const std::ffi::c_void,
+            k_ptr as *const std::ffi::c_void,
+            qo_ptr as *mut std::ffi::c_void,
+            ko_ptr as *mut std::ffi::c_void,
+            pos_ptr as *const i32,
             total_tokens,
             num_qo_heads,
             num_kv_heads,
             head_dim,
             &ffi_config,
             T::DTYPE.into(),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
 }
@@ -218,21 +236,28 @@ pub fn apply_rope_cached<T: GpuFloat>(
 ) -> Result<()> {
     let ffi_config = to_ffi_config(config);
 
+    let (q_ptr, _q_guard) = q.device_ptr(stream);
+    let (k_ptr, _k_guard) = k.device_ptr(stream);
+    let (qo_ptr, _qo_guard) = q_out.device_ptr_mut(stream);
+    let (ko_ptr, _ko_guard) = k_out.device_ptr_mut(stream);
+    let (cache_ptr, _cache_guard) = cos_sin_cache.device_ptr(stream);
+    let (pos_ptr, _pos_guard) = pos_ids.device_ptr(stream);
+
     unsafe {
         crate::ffi::apply_rope_with_cos_sin_cache(
-            *q.device_ptr() as *const std::ffi::c_void,
-            *k.device_ptr() as *const std::ffi::c_void,
-            *q_out.device_ptr() as *mut std::ffi::c_void,
-            *k_out.device_ptr() as *mut std::ffi::c_void,
-            *cos_sin_cache.device_ptr() as *const std::ffi::c_void,
-            *pos_ids.device_ptr() as *const i32,
+            q_ptr as *const std::ffi::c_void,
+            k_ptr as *const std::ffi::c_void,
+            qo_ptr as *mut std::ffi::c_void,
+            ko_ptr as *mut std::ffi::c_void,
+            cache_ptr as *const std::ffi::c_void,
+            pos_ptr as *const i32,
             total_tokens,
             num_qo_heads,
             num_kv_heads,
             head_dim,
             &ffi_config,
             T::DTYPE.into(),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
 }
@@ -244,7 +269,7 @@ pub fn apply_rope_cached<T: GpuFloat>(
 ///
 /// # Arguments
 ///
-/// * `device` - CUDA device
+/// * `stream` - CUDA stream
 /// * `max_seq_len` - Maximum sequence length to support
 /// * `config` - RoPE configuration
 ///
@@ -253,7 +278,7 @@ pub fn apply_rope_cached<T: GpuFloat>(
 /// Combined cos/sin cache tensor `[max_seq_len, rotary_dim]` (interleaved).
 #[cfg(feature = "cuda")]
 pub fn precompute_rope_cache(
-    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    stream: &std::sync::Arc<CudaStream>,
     max_seq_len: u32,
     config: &RoPEConfig,
 ) -> Result<CudaSlice<f32>> {
@@ -277,8 +302,8 @@ pub fn precompute_rope_cache(
         }
     }
 
-    device
-        .htod_sync_copy(&cache)
+    stream
+        .memcpy_stod(&cache)
         .map_err(|e| crate::FlashInferError::cuda(e.to_string()))
 }
 
@@ -343,8 +368,6 @@ pub struct RopeQuantAppendConfig {
 
 impl RopeQuantAppendConfig {
     /// Create configuration for GQA/MHA (no separate rope/nope dimensions).
-    ///
-    /// In this mode, head_dim equals rope_dim and no_rope_dim is 0.
     pub fn gqa(num_qo_heads: u32, num_kv_heads: u32, head_dim: u32, page_size: u32) -> Self {
         Self {
             num_qo_heads,
@@ -362,10 +385,6 @@ impl RopeQuantAppendConfig {
     }
 
     /// Create configuration for MLA (Multi-head Latent Attention).
-    ///
-    /// MLA uses separate rope and nope dimensions:
-    /// - rope_dim: dimension for rotary position encoding
-    /// - kv_lora_rank: dimension for the latent space (no_rope_dim)
     pub fn mla(
         num_qo_heads: u32,
         num_kv_heads: u32,
@@ -487,38 +506,7 @@ fn to_ffi_rope_quant_config<T: GpuFloat>(
 
 /// Fused RoPE + Quantize + Append to paged KV cache.
 ///
-/// This operation combines:
-/// 1. Apply RoPE to Q_rope and K_rope tensors
-/// 2. Quantize all outputs to FP8
-/// 3. Append K/V to paged cache
-///
 /// **Requires SM89+ (Ada Lovelace, Hopper)**
-///
-/// # Arguments
-///
-/// * `q_rope_in` - Query RoPE tensor `[nnz, num_qo_heads, rope_dim]`
-/// * `k_rope_in` - Key RoPE tensor `[nnz, num_kv_heads, rope_dim]`
-/// * `q_nope_in` - Query non-RoPE tensor `[nnz, num_qo_heads, no_rope_dim]` (empty for GQA)
-/// * `k_nope_in` - Key non-RoPE tensor `[nnz, num_kv_heads, no_rope_dim]` (empty for GQA)
-/// * `v_in` - Value tensor `[nnz, num_kv_heads, head_dim]`
-/// * `q_rope_out` - Output query RoPE tensor (FP8) `[nnz, num_qo_heads, rope_dim]`
-/// * `q_nope_out` - Output query non-RoPE tensor (FP8) (empty for GQA)
-/// * `k_cache` - Paged K cache (FP8)
-/// * `v_cache` - Paged V cache (FP8)
-/// * `kv_indptr` - Page offsets `[batch_size + 1]`
-/// * `kv_indices` - Page indices `[total_pages]`
-/// * `kv_last_page_len` - Tokens in last page before append `[batch_size]`
-/// * `batch_indices` - Batch index for each token `[nnz]`
-/// * `positions` - Position for each token within its sequence `[nnz]`
-/// * `cos_sin_cache` - Precomputed cos/sin cache `[max_pos, rope_dim]`
-/// * `pos_ids` - Position IDs for RoPE `[nnz]`
-/// * `nnz` - Total number of tokens
-/// * `config` - Configuration for the operation
-/// * `stream` - CUDA stream
-///
-/// # Errors
-///
-/// Returns `FLASHINFER_UNSUPPORTED` on GPUs with SM < 89 (pre-Ada Lovelace).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn rope_quant_append_paged_kv_cache<T: GpuFloat>(
@@ -546,38 +534,55 @@ pub fn rope_quant_append_paged_kv_cache<T: GpuFloat>(
 
     let ffi_config = to_ffi_rope_quant_config::<T>(config);
 
+    // Extract read pointers
+    let (qr_ptr, _qr_guard) = q_rope_in.device_ptr(stream);
+    let (kr_ptr, _kr_guard) = k_rope_in.device_ptr(stream);
+    let (v_ptr, _v_guard) = v_in.device_ptr(stream);
+    let (kvi_ptr, _kvi_guard) = kv_indptr.device_ptr(stream);
+    let (kvix_ptr, _kvix_guard) = kv_indices.device_ptr(stream);
+    let (kvlp_ptr, _kvlp_guard) = kv_last_page_len.device_ptr(stream);
+    let (bi_ptr, _bi_guard) = batch_indices.device_ptr(stream);
+    let (pos_ptr, _pos_guard) = positions.device_ptr(stream);
+    let (cs_ptr, _cs_guard) = cos_sin_cache.device_ptr(stream);
+    let (pid_ptr, _pid_guard) = pos_ids.device_ptr(stream);
+
     // Handle optional nope tensors
     let q_nope_ptr = q_nope_in
-        .map(|s| *s.device_ptr() as *const std::ffi::c_void)
+        .map(|s| { let (ptr, _guard) = s.device_ptr(stream); ptr as *const std::ffi::c_void })
         .unwrap_or(std::ptr::null());
     let k_nope_ptr = k_nope_in
-        .map(|s| *s.device_ptr() as *const std::ffi::c_void)
+        .map(|s| { let (ptr, _guard) = s.device_ptr(stream); ptr as *const std::ffi::c_void })
         .unwrap_or(std::ptr::null());
+
+    // Extract write pointers
+    let (qro_ptr, _qro_guard) = q_rope_out.device_ptr_mut(stream);
+    let (kc_ptr, _kc_guard) = k_cache.device_ptr_mut(stream);
+    let (vc_ptr, _vc_guard) = v_cache.device_ptr_mut(stream);
     let q_nope_out_ptr = q_nope_out
-        .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+        .map(|s| { let (ptr, _guard) = s.device_ptr_mut(stream); ptr as *mut std::ffi::c_void })
         .unwrap_or(std::ptr::null_mut());
 
     unsafe {
         crate::ffi::rope_quant_append_paged_kv_cache(
-            *q_rope_in.device_ptr() as *const std::ffi::c_void,
-            *k_rope_in.device_ptr() as *const std::ffi::c_void,
+            qr_ptr as *const std::ffi::c_void,
+            kr_ptr as *const std::ffi::c_void,
             q_nope_ptr,
             k_nope_ptr,
-            *v_in.device_ptr() as *const std::ffi::c_void,
-            *q_rope_out.device_ptr() as *mut std::ffi::c_void,
+            v_ptr as *const std::ffi::c_void,
+            qro_ptr as *mut std::ffi::c_void,
             q_nope_out_ptr,
-            *k_cache.device_ptr() as *mut std::ffi::c_void,
-            *v_cache.device_ptr() as *mut std::ffi::c_void,
-            *kv_indptr.device_ptr() as *const i32,
-            *kv_indices.device_ptr() as *const i32,
-            *kv_last_page_len.device_ptr() as *const i32,
-            *batch_indices.device_ptr() as *const i32,
-            *positions.device_ptr() as *const i32,
-            *cos_sin_cache.device_ptr() as *const f32,
-            *pos_ids.device_ptr() as *const i32,
+            kc_ptr as *mut std::ffi::c_void,
+            vc_ptr as *mut std::ffi::c_void,
+            kvi_ptr as *const i32,
+            kvix_ptr as *const i32,
+            kvlp_ptr as *const i32,
+            bi_ptr as *const i32,
+            pos_ptr as *const i32,
+            cs_ptr as *const f32,
+            pid_ptr as *const i32,
             nnz,
             &ffi_config,
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
 }

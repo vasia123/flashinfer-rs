@@ -13,7 +13,7 @@
 //! ```
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 use crate::config::NormConfig;
 use crate::types::{DType, GpuFloat};
@@ -173,16 +173,20 @@ pub fn rmsnorm<T: GpuFloat>(
     config: &NormConfig,
     stream: &CudaStream,
 ) -> Result<()> {
+    let (input_ptr, _input_guard) = input.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let status = unsafe {
         ffi::flashinfer_rmsnorm(
-            *input.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -211,18 +215,20 @@ pub fn rmsnorm_inplace<T: GpuFloat>(
     config: &NormConfig,
     stream: &CudaStream,
 ) -> Result<()> {
-    // In-place: input and output are the same buffer
-    let ptr = *input.device_ptr();
+    // In-place: input and output are the same buffer — use device_ptr_mut since it's modified
+    let (ptr, _input_guard) = input.device_ptr_mut(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+
     let status = unsafe {
         ffi::flashinfer_rmsnorm(
             ptr as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
             ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -281,19 +287,23 @@ pub fn rmsnorm_quant<T: GpuFloat>(
         ));
     }
 
+    let (input_ptr, _input_guard) = input.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let mut scale_val = scale;
     let status = unsafe {
         ffi::flashinfer_rmsnorm_quant(
-            *input.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             &mut scale_val,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
             dtype_to_ffi(output_dtype),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -329,17 +339,22 @@ pub fn fused_add_rmsnorm<T: GpuFloat>(
     config: &NormConfig,
     stream: &CudaStream,
 ) -> Result<()> {
+    let (input_ptr, _input_guard) = input.device_ptr_mut(stream);
+    let (residual_ptr, _residual_guard) = residual.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let status = unsafe {
         ffi::flashinfer_fused_add_rmsnorm(
-            *input.device_ptr() as *mut std::ffi::c_void,
-            *residual.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *mut std::ffi::c_void,
+            residual_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -379,21 +394,32 @@ pub fn layernorm<T: GpuFloat>(
         ));
     }
 
+    let (input_ptr, _input_guard) = input.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let bias_ptr = bias
-        .map(|b| *b.device_ptr() as *const std::ffi::c_void)
+        .map(|b| {
+            let (ptr, _guard) = b.device_ptr(stream);
+            // NOTE: _guard is dropped at end of this closure, but the pointer remains valid
+            // because the CudaSlice `b` is still alive for the duration of the FFI call.
+            // In cudarc 0.16, the guard prevents reuse of the buffer by the allocator;
+            // however the underlying device memory is owned by the CudaSlice, not the guard.
+            ptr as *const std::ffi::c_void
+        })
         .unwrap_or(std::ptr::null());
 
     let status = unsafe {
         ffi::flashinfer_layernorm(
-            *input.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
             bias_ptr,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -426,17 +452,21 @@ pub fn qk_rmsnorm<T: GpuFloat>(
     eps: f32,
     stream: &CudaStream,
 ) -> Result<()> {
+    let (input_ptr, _input_guard) = input.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let status = unsafe {
         ffi::flashinfer_qk_rmsnorm(
-            *input.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             num_heads,
             head_dim,
             eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -470,16 +500,20 @@ pub fn gemma_rmsnorm<T: GpuFloat>(
     config: &NormConfig,
     stream: &CudaStream,
 ) -> Result<()> {
+    let (input_ptr, _input_guard) = input.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let status = unsafe {
         ffi::flashinfer_gemma_rmsnorm(
-            *input.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 
@@ -515,17 +549,22 @@ pub fn gemma_fused_add_rmsnorm<T: GpuFloat>(
     config: &NormConfig,
     stream: &CudaStream,
 ) -> Result<()> {
+    let (input_ptr, _input_guard) = input.device_ptr_mut(stream);
+    let (residual_ptr, _residual_guard) = residual.device_ptr(stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
+
     let status = unsafe {
         ffi::flashinfer_gemma_fused_add_rmsnorm(
-            *input.device_ptr() as *mut std::ffi::c_void,
-            *residual.device_ptr() as *const std::ffi::c_void,
-            *weight.device_ptr() as *const std::ffi::c_void,
-            *output.device_ptr() as *mut std::ffi::c_void,
+            input_ptr as *mut std::ffi::c_void,
+            residual_ptr as *const std::ffi::c_void,
+            weight_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
             batch_size,
             hidden_dim,
             config.eps,
             dtype_to_ffi(T::DTYPE),
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
 

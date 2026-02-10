@@ -4,7 +4,7 @@
 //! key-value caches in transformer inference.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaStream, CudaSlice, DevicePtr, DevicePtrMut};
 
 #[cfg(feature = "cuda")]
 use std::marker::PhantomData;
@@ -201,8 +201,8 @@ pub struct PagedKVCache<T: GpuFloat> {
     /// Current batch size (set by set_batch_metadata)
     batch_size: usize,
 
-    /// Device reference
-    device: Arc<CudaDevice>,
+    /// Stream reference
+    stream: Arc<CudaStream>,
 
     /// Maximum number of pages in the pool
     max_num_pages: usize,
@@ -232,14 +232,14 @@ impl<T: GpuFloat> PagedKVCache<T> {
     ///
     /// # Arguments
     ///
-    /// * `device` - CUDA device
+    /// * `stream` - CUDA stream
     /// * `max_num_pages` - Maximum number of pages to allocate
     /// * `page_size` - Number of tokens per page
     /// * `num_kv_heads` - Number of key/value heads
     /// * `head_dim` - Dimension of each head
     /// * `layout` - Memory layout (NHD or HND)
     pub fn new(
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
         max_num_pages: usize,
         page_size: u32,
         num_kv_heads: u32,
@@ -255,11 +255,11 @@ impl<T: GpuFloat> PagedKVCache<T> {
         let total_elements = max_num_pages * elements_per_page;
 
         // Allocate K and V buffers
-        let k_data = device
+        let k_data = stream
             .alloc_zeros::<T>(total_elements)
             .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
 
-        let v_data = device
+        let v_data = stream
             .alloc_zeros::<T>(total_elements)
             .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
 
@@ -270,7 +270,7 @@ impl<T: GpuFloat> PagedKVCache<T> {
             indptr_gpu: None,
             last_page_len_gpu: None,
             batch_size: 0,
-            device,
+            stream,
             max_num_pages,
             page_size,
             num_kv_heads,
@@ -346,9 +346,9 @@ impl<T: GpuFloat> PagedKVCache<T> {
         self.dtype
     }
 
-    /// Get device reference.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Get stream reference.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Upload batch metadata to GPU.
@@ -363,16 +363,16 @@ impl<T: GpuFloat> PagedKVCache<T> {
 
         // Upload indptr
         let indptr_gpu = self
-            .device
-            .htod_sync_copy(&metadata.indptr)
+            .stream
+            .memcpy_stod(&metadata.indptr)
             .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
         self.indptr_gpu = Some(indptr_gpu);
 
         // Upload indices
         if !metadata.indices.is_empty() {
             let indices_gpu = self
-                .device
-                .htod_sync_copy(&metadata.indices)
+                .stream
+                .memcpy_stod(&metadata.indices)
                 .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
             self.indices_gpu = Some(indices_gpu);
         } else {
@@ -381,8 +381,8 @@ impl<T: GpuFloat> PagedKVCache<T> {
 
         // Upload last_page_len
         let last_page_len_gpu = self
-            .device
-            .htod_sync_copy(&metadata.last_page_len)
+            .stream
+            .memcpy_stod(&metadata.last_page_len)
             .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
         self.last_page_len_gpu = Some(last_page_len_gpu);
 
@@ -436,28 +436,38 @@ impl<T: GpuFloat> PagedKVCache<T> {
         // Create append_indptr: [0, 1, 2, ..., batch_size]
         let append_indptr: Vec<i32> = (0..=batch_size).collect();
         let append_indptr_gpu = self
-            .device
-            .htod_sync_copy(&append_indptr)
+            .stream
+            .memcpy_stod(&append_indptr)
             .map_err(|e| crate::FlashInferError::cuda(e.to_string()))?;
+
+        // Extract device pointers
+        let (key_ptr, _key_guard) = key.device_ptr(stream);
+        let (value_ptr, _value_guard) = value.device_ptr(stream);
+        let (k_data_ptr, _k_data_guard) = self.k_data.device_ptr_mut(stream);
+        let (v_data_ptr, _v_data_guard) = self.v_data.device_ptr_mut(stream);
+        let (indptr_ptr, _indptr_guard) = indptr_gpu.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = indices_gpu.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = last_page_len_gpu.device_ptr(stream);
+        let (append_indptr_ptr, _ai_guard) = append_indptr_gpu.device_ptr(stream);
 
         // Call FFI
         unsafe {
             crate::ffi::append_paged_kv_cache(
-                *key.device_ptr() as *const std::ffi::c_void,
-                *value.device_ptr() as *const std::ffi::c_void,
-                *self.k_data.device_ptr() as *mut std::ffi::c_void,
-                *self.v_data.device_ptr() as *mut std::ffi::c_void,
-                *indptr_gpu.device_ptr() as *const i32,
-                *indices_gpu.device_ptr() as *const i32,
-                *last_page_len_gpu.device_ptr() as *const i32,
-                *append_indptr_gpu.device_ptr() as *const i32,
+                key_ptr as *const std::ffi::c_void,
+                value_ptr as *const std::ffi::c_void,
+                k_data_ptr as *mut std::ffi::c_void,
+                v_data_ptr as *mut std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                append_indptr_ptr as *const i32,
                 batch_size,
                 self.num_kv_heads as i32,
                 self.head_dim as i32,
                 self.page_size as i32,
                 self.dtype.into(),
                 self.layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )
         }
     }
@@ -508,24 +518,34 @@ impl<T: GpuFloat> PagedKVCache<T> {
             return Ok(());
         }
 
+        // Extract device pointers
+        let (keys_ptr, _keys_guard) = keys.device_ptr(stream);
+        let (values_ptr, _values_guard) = values.device_ptr(stream);
+        let (k_data_ptr, _k_data_guard) = self.k_data.device_ptr_mut(stream);
+        let (v_data_ptr, _v_data_guard) = self.v_data.device_ptr_mut(stream);
+        let (indptr_ptr, _indptr_guard) = indptr_gpu.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = indices_gpu.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = last_page_len_gpu.device_ptr(stream);
+        let (append_indptr_ptr, _ai_guard) = append_indptr.device_ptr(stream);
+
         // Call FFI
         unsafe {
             crate::ffi::append_paged_kv_cache(
-                *keys.device_ptr() as *const std::ffi::c_void,
-                *values.device_ptr() as *const std::ffi::c_void,
-                *self.k_data.device_ptr() as *mut std::ffi::c_void,
-                *self.v_data.device_ptr() as *mut std::ffi::c_void,
-                *indptr_gpu.device_ptr() as *const i32,
-                *indices_gpu.device_ptr() as *const i32,
-                *last_page_len_gpu.device_ptr() as *const i32,
-                *append_indptr.device_ptr() as *const i32,
+                keys_ptr as *const std::ffi::c_void,
+                values_ptr as *const std::ffi::c_void,
+                k_data_ptr as *mut std::ffi::c_void,
+                v_data_ptr as *mut std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                append_indptr_ptr as *const i32,
                 batch_size,
                 self.num_kv_heads as i32,
                 self.head_dim as i32,
                 self.page_size as i32,
                 self.dtype.into(),
                 self.layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )
         }
     }
@@ -533,10 +553,13 @@ impl<T: GpuFloat> PagedKVCache<T> {
     /// Get raw device pointers for FFI.
     ///
     /// Returns (k_ptr, v_ptr) as raw device pointers.
-    pub fn device_ptrs(&self) -> (*const T, *const T) {
+    /// Requires a stream reference for pointer extraction in cudarc 0.16.
+    pub fn device_ptrs(&self, stream: &CudaStream) -> (*const T, *const T) {
+        let (k_ptr, _k_guard) = self.k_data.device_ptr(stream);
+        let (v_ptr, _v_guard) = self.v_data.device_ptr(stream);
         (
-            *self.k_data.device_ptr() as *const T,
-            *self.v_data.device_ptr() as *const T,
+            k_ptr as *const T,
+            v_ptr as *const T,
         )
     }
 }
@@ -610,9 +633,9 @@ impl PagedKVCacheBuilder {
 
     /// Build the PagedKVCache.
     #[cfg(feature = "cuda")]
-    pub fn build<T: GpuFloat>(self, device: Arc<CudaDevice>) -> Result<PagedKVCache<T>> {
+    pub fn build<T: GpuFloat>(self, stream: Arc<CudaStream>) -> Result<PagedKVCache<T>> {
         PagedKVCache::new(
-            device,
+            stream,
             self.max_num_pages,
             self.page_size,
             self.num_kv_heads,

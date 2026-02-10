@@ -8,7 +8,7 @@ use crate::page_table::PageTable;
 use crate::types::GpuFloat;
 use crate::workspace::Workspace;
 use crate::{ffi, AttentionConfig, FlashInferError, KVLayout, Result};
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaStream, CudaSlice, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
 
 /// Handler for batched decode attention with paged KV cache.
@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```ignore
-/// let handler = BatchDecodeHandler::new(device, config)?;
+/// let handler = BatchDecodeHandler::new(stream, config)?;
 ///
 /// // Plan the computation (call once per batch shape)
 /// handler.plan(batch_size, kv_lengths, page_table, &stream)?;
@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// handler.forward(&query, &kv_cache_k, &kv_cache_v, &mut output, &stream)?;
 /// ```
 pub struct BatchDecodeHandler {
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
     config: AttentionConfig,
     workspace: Workspace,
     // Cached plan data (None until plan() is called)
@@ -54,11 +54,11 @@ struct DecodePlanData {
 
 impl BatchDecodeHandler {
     /// Create a new batch decode handler.
-    pub fn new(device: Arc<CudaDevice>, config: AttentionConfig) -> Result<Self> {
-        let workspace = Workspace::new(&device)?;
+    pub fn new(stream: Arc<CudaStream>, config: AttentionConfig) -> Result<Self> {
+        let workspace = Workspace::new(&stream)?;
 
         Ok(Self {
-            device,
+            stream,
             config,
             workspace,
             plan_data: None,
@@ -113,9 +113,9 @@ impl BatchDecodeHandler {
             page_table.compute_kv_last_page_len(kv_lengths, self.config.page_size as usize);
 
         // Upload arrays to GPU
-        let kv_indptr_d = self.device.htod_sync_copy(&kv_indptr)?;
-        let kv_indices_d = self.device.htod_sync_copy(&kv_indices)?;
-        let kv_last_page_len_d = self.device.htod_sync_copy(&kv_last_page_len)?;
+        let kv_indptr_d = self.stream.memcpy_stod(&kv_indptr)?;
+        let kv_indices_d = self.stream.memcpy_stod(&kv_indices)?;
+        let kv_last_page_len_d = self.stream.memcpy_stod(&kv_last_page_len)?;
 
         // Ensure workspace is large enough
         let max_seq_len = kv_lengths.iter().copied().max().unwrap_or(0) as u32;
@@ -129,28 +129,31 @@ impl BatchDecodeHandler {
         );
         self.workspace.ensure_sizes(float_size, int_size)?;
 
-        // Create FFI plan
-        let plan = unsafe {
-            ffi::BatchDecodePlan::new(
-                self.workspace.float_ptr() as *mut std::ffi::c_void,
-                self.workspace.float_size(),
-                self.workspace.int_ptr() as *mut std::ffi::c_void,
-                self.workspace.int_size(),
-                std::ptr::null_mut(), // page_locked_workspace (optional)
-                0,                    // page_locked_size
-                *kv_indptr_d.device_ptr() as *const i32,
-                batch_size as i32,
-                self.config.num_qo_heads as i32,
-                self.config.num_kv_heads as i32,
-                self.config.head_dim_qk as i32,
-                self.config.page_size as i32,
-                T::DTYPE.into(),
-                self.config.pos_encoding.into(),
-                self.config.logits_soft_cap.unwrap_or(0.0),
-                self.config.window_left.unwrap_or(-1), // -1 = full attention
-                false,                                 // enable_cuda_graph
-                stream.stream as *mut std::ffi::c_void,
-            )?
+        // Create FFI plan — scope the guard so it drops before we move kv_indptr_d
+        let plan = {
+            let (indptr_ptr, _indptr_guard) = kv_indptr_d.device_ptr(stream);
+            unsafe {
+                ffi::BatchDecodePlan::new(
+                    self.workspace.float_ptr() as *mut std::ffi::c_void,
+                    self.workspace.float_size(),
+                    self.workspace.int_ptr() as *mut std::ffi::c_void,
+                    self.workspace.int_size(),
+                    std::ptr::null_mut(), // page_locked_workspace (optional)
+                    0,                    // page_locked_size
+                    indptr_ptr as *const i32,
+                    batch_size as i32,
+                    self.config.num_qo_heads as i32,
+                    self.config.num_kv_heads as i32,
+                    self.config.head_dim_qk as i32,
+                    self.config.page_size as i32,
+                    T::DTYPE.into(),
+                    self.config.pos_encoding.into(),
+                    self.config.logits_soft_cap.unwrap_or(0.0),
+                    self.config.window_left.unwrap_or(-1), // -1 = full attention
+                    false,                                 // enable_cuda_graph
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )?
+            }
         };
 
         self.plan_data = Some(DecodePlanData {
@@ -194,18 +197,27 @@ impl BatchDecodeHandler {
             .as_ref()
             .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
+        // Extract all pointers before the unsafe block so guards live long enough
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (indptr_ptr, _indptr_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+
         unsafe {
             plan_data.plan.run(
-                *query.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_k.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_v.device_ptr() as *const std::ffi::c_void,
-                *plan_data.kv_indptr_d.device_ptr() as *const i32,
-                *plan_data.kv_indices_d.device_ptr() as *const i32,
-                *plan_data.kv_last_page_len_d.device_ptr() as *const i32,
-                *output.device_ptr() as *mut std::ffi::c_void,
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
                 std::ptr::null_mut(), // lse (optional)
                 plan_data.kv_layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
 
@@ -230,18 +242,27 @@ impl BatchDecodeHandler {
             .as_ref()
             .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward()"))?;
 
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (indptr_ptr, _indptr_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+        let (lse_ptr, _lse_guard) = lse.device_ptr_mut(stream);
+
         unsafe {
             plan_data.plan.run(
-                *query.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_k.device_ptr() as *const std::ffi::c_void,
-                *kv_cache_v.device_ptr() as *const std::ffi::c_void,
-                *plan_data.kv_indptr_d.device_ptr() as *const i32,
-                *plan_data.kv_indices_d.device_ptr() as *const i32,
-                *plan_data.kv_last_page_len_d.device_ptr() as *const i32,
-                *output.device_ptr() as *mut std::ffi::c_void,
-                *lse.device_ptr() as *mut f32,
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
+                lse_ptr as *mut f32,
                 plan_data.kv_layout.into(),
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
 
@@ -257,14 +278,16 @@ impl BatchDecodeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cudarc::driver::CudaContext;
 
     // Tests require CUDA device, so they're marked ignore by default
     #[test]
     #[ignore]
     fn test_batch_decode_handler_creation() {
-        let device = CudaDevice::new(0).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let config = AttentionConfig::new(32, 8, 128);
-        let handler = BatchDecodeHandler::new(device, config).unwrap();
+        let handler = BatchDecodeHandler::new(stream, config).unwrap();
 
         assert_eq!(handler.config().num_qo_heads, 32);
         assert_eq!(handler.config().num_kv_heads, 8);
