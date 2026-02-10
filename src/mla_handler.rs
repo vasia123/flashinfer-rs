@@ -234,10 +234,10 @@ impl MLAHandler {
                 indices_ptr as *const i32,
                 out_ptr as *mut std::ffi::c_void,
                 std::ptr::null_mut(), // no LSE
-                mask_mode,
+                mask_mode.into(),
                 self.config.sm_scale(),
-                T::DTYPE,
-                T::DTYPE,
+                T::DTYPE.into(),
+                T::DTYPE.into(),
                 stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
@@ -287,10 +287,10 @@ impl MLAHandler {
                 indices_ptr as *const i32,
                 out_ptr as *mut std::ffi::c_void,
                 lse_ptr as *mut f32,
-                mask_mode,
+                mask_mode.into(),
                 self.config.sm_scale(),
-                T::DTYPE,
-                T::DTYPE,
+                T::DTYPE.into(),
+                T::DTYPE.into(),
                 stream.cu_stream() as *mut std::ffi::c_void,
             )?;
         }
