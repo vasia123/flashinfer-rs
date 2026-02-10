@@ -21,6 +21,12 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Pinned FlashInfer C++ commit for reproducible builds.
+/// Update this when upgrading the FlashInfer backend.
+const FLASHINFER_REPO: &str = "https://github.com/flashinfer-ai/flashinfer.git";
+const FLASHINFER_COMMIT: &str = "bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6";
 
 /// CUDA source modules for incremental compilation.
 /// Split from monolithic flashinfer_c_api.cu for faster rebuilds.
@@ -142,7 +148,13 @@ fn find_cuda_path() -> Option<PathBuf> {
     None
 }
 
-/// Find FlashInfer source directory
+/// Find FlashInfer source directory.
+///
+/// Search order:
+/// 1. `FLASHINFER_PATH` environment variable
+/// 2. `references/flashinfer` relative to crate root (local dev)
+/// 3. `flashinfer` relative to crate root (alternative)
+/// 4. Auto-download to `OUT_DIR/flashinfer-source` (Cargo git deps, CI)
 fn find_flashinfer_path() -> Option<PathBuf> {
     // Check environment variable
     if let Ok(path) = env::var("FLASHINFER_PATH") {
@@ -165,7 +177,106 @@ fn find_flashinfer_path() -> Option<PathBuf> {
         return Some(alt_path);
     }
 
-    None
+    // Auto-download to OUT_DIR (for Cargo git dependencies and CI)
+    let out_dir = env::var("OUT_DIR").ok()?;
+    let download_path = PathBuf::from(&out_dir).join("flashinfer-source");
+    if download_path.join("include/flashinfer").exists() {
+        println!(
+            "cargo:warning=Using cached FlashInfer source at: {}",
+            download_path.display()
+        );
+        return Some(download_path);
+    }
+
+    println!("cargo:warning=FlashInfer source not found locally. Downloading...");
+    match download_flashinfer(&download_path) {
+        Ok(()) => {
+            println!(
+                "cargo:warning=Downloaded FlashInfer to: {}",
+                download_path.display()
+            );
+            Some(download_path)
+        }
+        Err(e) => {
+            println!("cargo:warning=Failed to download FlashInfer: {}", e);
+            None
+        }
+    }
+}
+
+/// Download FlashInfer C++ source to the given path.
+///
+/// Uses shallow clone + sparse checkout to download only `include/` directory,
+/// minimizing download size (~15 MB vs ~500 MB for full repo).
+fn download_flashinfer(target: &Path) -> Result<(), String> {
+    // Clean up any partial previous download
+    if target.exists() {
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("Failed to clean up {}: {}", target.display(), e))?;
+    }
+
+    // Shallow clone with sparse checkout (only include/ directory)
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            FLASHINFER_REPO,
+            target.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+
+    if !status.success() {
+        return Err("git clone failed".to_string());
+    }
+
+    // Set sparse-checkout to include/ only
+    let status = Command::new("git")
+        .args(["sparse-checkout", "set", "include"])
+        .current_dir(target)
+        .status()
+        .map_err(|e| format!("Failed to set sparse-checkout: {}", e))?;
+
+    if !status.success() {
+        return Err("git sparse-checkout failed".to_string());
+    }
+
+    // Checkout pinned commit
+    let status = Command::new("git")
+        .args(["fetch", "--depth", "1", "origin", FLASHINFER_COMMIT])
+        .current_dir(target)
+        .status()
+        .map_err(|e| format!("Failed to fetch commit: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "git fetch commit {} failed",
+            &FLASHINFER_COMMIT[..12]
+        ));
+    }
+
+    let status = Command::new("git")
+        .args(["checkout", FLASHINFER_COMMIT])
+        .current_dir(target)
+        .status()
+        .map_err(|e| format!("Failed to checkout: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "git checkout {} failed",
+            &FLASHINFER_COMMIT[..12]
+        ));
+    }
+
+    // Verify download succeeded
+    if !target.join("include/flashinfer").exists() {
+        return Err("Download succeeded but include/flashinfer not found".to_string());
+    }
+
+    Ok(())
 }
 
 /// Determine target CUDA architecture

@@ -14,16 +14,21 @@ Rust bindings for FlashInfer — high-performance attention kernels for LLM infe
 ## Reference
 
 FlashInfer source: https://github.com/flashinfer-ai/flashinfer
+Pinned commit: `bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6`
 
-### Setup reference
+### FlashInfer C++ source
+
+The build system auto-downloads FlashInfer headers to `OUT_DIR/flashinfer-source`
+when building as a Cargo dependency. For local development, you can also pre-clone:
 
 ```bash
 cd ~/projects_hobby/flashinfer-rs
-if [ ! -d "references/flashinfer" ]; then
-    mkdir -p references
-    git clone --depth 1 https://github.com/flashinfer-ai/flashinfer.git references/flashinfer
-fi
+mkdir -p references
+git clone --depth 1 https://github.com/flashinfer-ai/flashinfer.git references/flashinfer
+cd references/flashinfer && git checkout bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6
 ```
+
+Override with `FLASHINFER_PATH` env var if needed.
 
 ### Key directories to study (in references/flashinfer/)
 - `include/flashinfer/` — C++ headers with kernel interfaces
