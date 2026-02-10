@@ -363,7 +363,7 @@ FlashInferStatus flashinfer_mla_run(
     // Note: FlashInfer's BatchMLAPagedAttention has fixed dimensions
     #define DISPATCH_MLA_RUN(DTypeQ, DTypeKV) \
         do { \
-            flashinfer::mla::MLAParams<DTypeQ, DTypeKV, DTypeQ, int32_t> params; \
+            flashinfer::MLAParams<DTypeQ, DTypeKV, DTypeQ, int32_t> params; \
             \
             params.q_nope = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q_nope)); \
             params.q_pe = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q_pe)); \

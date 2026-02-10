@@ -33,8 +33,7 @@ const FLASHINFER_COMMIT: &str = "bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6";
 const CUDA_MODULES: &[&str] = &[
     "flashinfer_decode.cu",     // Batch decode attention (8 variants) - slowest
     "flashinfer_prefill.cu",    // Batch prefill attention (8 variants) - slowest
-    // TODO: flashinfer_mla.cu disabled — FlashInfer headers lack mla::MLAParams.
-    // Re-enable when MLA kernel support is added (Этап 0.5).
+    "flashinfer_mla.cu",        // MLA attention (DeepSeek v2/v3)
     "flashinfer_norm.cu",       // RMSNorm, LayerNorm, etc.
     "flashinfer_sampling.cu",   // top_k, top_p, etc.
     "flashinfer_rope.cu",       // Rotary position embedding
