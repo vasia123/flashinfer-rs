@@ -436,6 +436,61 @@ impl BatchDecodePlan {
 
         check_status(status)
     }
+
+    /// Execute batch decode against an FP8 (E4M3 / E5M2) paged KV cache.
+    ///
+    /// Compared to [`Self::run`] the `k_cache` / `v_cache` buffers are
+    /// expected to be packed U8 bytes holding `__nv_fp8_e4m3` or
+    /// `__nv_fp8_e5m2` values, and per-tensor F32 scales are applied
+    /// kernel-side: `k_dequant = k_byte * k_scale`, similarly for V.
+    ///
+    /// `q_scale` scales the Q tensor before the QK^T matmul. For Q
+    /// kept in F16/BF16 (the common case in vllm-rust today) pass
+    /// `1.0` — the kernel still walks the FP8 K/V path, which is all
+    /// we need.
+    ///
+    /// # Safety
+    /// All pointers must point to valid GPU memory with the layouts
+    /// described in `Self::run`. Scale values must be finite and
+    /// non-NaN. The plan must have been built with the same
+    /// (num_qo_heads, num_kv_heads, head_dim, page_size) tuple as the
+    /// cache buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_fp8(
+        &self,
+        q: *const std::ffi::c_void,
+        k_cache: *const std::ffi::c_void,
+        v_cache: *const std::ffi::c_void,
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        kv_last_page_len: *const i32,
+        output: *mut std::ffi::c_void,
+        lse: *mut f32,
+        q_scale: f32,
+        k_scale: f32,
+        v_scale: f32,
+        kv_layout: KVLayout,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        let status = flashinfer_batch_decode_run_fp8(
+            self.handle,
+            q,
+            k_cache,
+            v_cache,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            output,
+            lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            kv_layout.into(),
+            stream,
+        );
+
+        check_status(status)
+    }
 }
 
 impl Drop for BatchDecodePlan {
