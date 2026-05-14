@@ -14,7 +14,7 @@ Rust bindings for FlashInfer — high-performance attention kernels for LLM infe
 ## Reference
 
 FlashInfer source: https://github.com/flashinfer-ai/flashinfer
-Pinned commit: `bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6`
+Pinned commit: `ed0f5f89dc5a817f70d85462355e82a693016a3d`
 
 ### FlashInfer C++ source
 
@@ -25,7 +25,7 @@ when building as a Cargo dependency. For local development, you can also pre-clo
 cd ~/projects_hobby/flashinfer-rs
 mkdir -p references
 git clone --depth 1 https://github.com/flashinfer-ai/flashinfer.git references/flashinfer
-cd references/flashinfer && git checkout bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6
+cd references/flashinfer && git checkout ed0f5f89dc5a817f70d85462355e82a693016a3d
 ```
 
 Override with `FLASHINFER_PATH` env var if needed.

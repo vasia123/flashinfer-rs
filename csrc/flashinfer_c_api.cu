@@ -1240,9 +1240,12 @@ cudaError_t call_top_k_sampling_f32(
     cudaStream_t stream
 ) {
     return flashinfer::sampling::TopKSamplingFromProb<float, int32_t>(
-        probs, output, nullptr, top_k_arr,
-        batch_size, top_k_val, vocab_size,
-        deterministic, philox_seed, philox_offset, stream
+        probs, output,
+        /*valid=*/nullptr, /*indices=*/nullptr,
+        top_k_arr, batch_size, top_k_val, vocab_size, deterministic,
+        /*seed_arr=*/nullptr, philox_seed,
+        /*offset_arr=*/nullptr, philox_offset,
+        stream
     );
 }
 
@@ -1253,9 +1256,12 @@ cudaError_t call_top_p_sampling_f32(
     cudaStream_t stream
 ) {
     return flashinfer::sampling::TopPSamplingFromProb<float, int32_t>(
-        probs, output, nullptr, top_p_arr,
-        batch_size, top_p_val, vocab_size,
-        deterministic, philox_seed, philox_offset, stream
+        probs, output,
+        /*valid=*/nullptr, /*indices=*/nullptr,
+        top_p_arr, batch_size, top_p_val, vocab_size, deterministic,
+        /*seed_arr=*/nullptr, philox_seed,
+        /*offset_arr=*/nullptr, philox_offset,
+        stream
     );
 }
 
@@ -1266,9 +1272,12 @@ cudaError_t call_min_p_sampling_f32(
     cudaStream_t stream
 ) {
     return flashinfer::sampling::MinPSamplingFromProb<float, int32_t>(
-        probs, min_p_arr, output, nullptr,
-        batch_size, min_p_val, vocab_size,
-        deterministic, philox_seed, philox_offset, stream
+        probs, min_p_arr, output,
+        /*valid=*/nullptr, /*indices=*/nullptr,
+        batch_size, min_p_val, vocab_size, deterministic,
+        /*seed_arr=*/nullptr, philox_seed,
+        /*offset_arr=*/nullptr, philox_offset,
+        stream
     );
 }
 
@@ -1279,9 +1288,12 @@ cudaError_t call_top_k_top_p_sampling_f32(
     cudaStream_t stream
 ) {
     return flashinfer::sampling::TopKTopPSamplingFromProb<float, int32_t>(
-        probs, top_k_arr, top_p_arr, output, nullptr,
-        batch_size, top_k_val, top_p_val, vocab_size,
-        deterministic, philox_seed, philox_offset, stream
+        probs, top_k_arr, top_p_arr, output,
+        /*valid=*/nullptr, /*indices=*/nullptr,
+        batch_size, top_k_val, top_p_val, vocab_size, deterministic,
+        /*seed_arr=*/nullptr, philox_seed,
+        /*offset_arr=*/nullptr, philox_offset,
+        stream
     );
 }
 

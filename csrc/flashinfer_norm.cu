@@ -131,8 +131,21 @@ FlashInferStatus flashinfer_rmsnorm_quant(
 
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
-    // Read scale value from pointer (user provides pre-computed quantization scale)
-    float scale_val = *scale;
+    // FlashInfer (post ed0f5f8) expects `scale` as a device pointer.
+    // Our FFI contract still accepts a host pointer to a precomputed scalar
+    // (keeps the Rust safe wrapper free of GPU allocations for a single float),
+    // so we stage it into a 4-byte device buffer for the duration of the call.
+    float* scale_d = nullptr;
+    err = cudaMallocAsync(&scale_d, sizeof(float), cuda_stream);
+    if (err != cudaSuccess) {
+        return from_cuda_error(err);
+    }
+    err = cudaMemcpyAsync(scale_d, scale, sizeof(float),
+                          cudaMemcpyHostToDevice, cuda_stream);
+    if (err != cudaSuccess) {
+        cudaFreeAsync(scale_d, cuda_stream);
+        return from_cuda_error(err);
+    }
 
     // Contiguous layout stride
     uint32_t stride = hidden_dim;
@@ -151,7 +164,7 @@ FlashInferStatus flashinfer_rmsnorm_quant(
             hidden_dim, \
             stride, \
             stride, \
-            scale_val, \
+            scale_d, \
             eps, \
             false, \
             cuda_stream \
@@ -170,16 +183,19 @@ FlashInferStatus flashinfer_rmsnorm_quant(
             DISPATCH_FP8_QUANT(__nv_bfloat16, __nv_fp8_e5m2);
         }
     } else {
+        cudaFreeAsync(scale_d, cuda_stream);
         set_error("Unsupported input dtype for rmsnorm_quant (must be FP16 or BF16)");
         return FLASHINFER_UNSUPPORTED;
     }
 
     #undef DISPATCH_FP8_QUANT
 #else
+    cudaFreeAsync(scale_d, cuda_stream);
     set_error("FP8 quantized RMSNorm compiled without SM89+ support");
     return FLASHINFER_UNSUPPORTED;
 #endif
 
+    cudaFreeAsync(scale_d, cuda_stream);
     return from_cuda_error(err);
 }
 

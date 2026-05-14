@@ -26,7 +26,13 @@ use std::process::Command;
 /// Pinned FlashInfer C++ commit for reproducible builds.
 /// Update this when upgrading the FlashInfer backend.
 const FLASHINFER_REPO: &str = "https://github.com/flashinfer-ai/flashinfer.git";
-const FLASHINFER_COMMIT: &str = "bd0b27b4cc68b2e5ba30178b4b3b781c5ed1ece6";
+const FLASHINFER_COMMIT: &str = "ed0f5f89dc5a817f70d85462355e82a693016a3d";
+
+/// Vendored CCCL (libcudacxx + cub + thrust) — pinned to the same commit FlashInfer
+/// ships as a submodule. Required because post-`6ddbdb0` FlashInfer relies on
+/// `cuda::fast_mod_div` from libcudacxx, which is newer than what CUDA 12.0 bundles.
+const CCCL_REPO: &str = "https://github.com/NVIDIA/cccl.git";
+const CCCL_COMMIT: &str = "876867684f7fac130e0f5911236e0a92a970d4fd";
 
 /// CUDA source modules for incremental compilation.
 /// Split from monolithic flashinfer_c_api.cu for faster rebuilds.
@@ -95,8 +101,19 @@ fn main() {
     let cuda_arch = determine_cuda_arch();
     println!("cargo:warning=Target CUDA architecture: SM{}", cuda_arch);
 
+    // Ensure CCCL (libcudacxx) is available — required since the post-6ddbdb0
+    // FlashInfer headers rely on `cuda::fast_mod_div` from a newer libcudacxx
+    // than the one bundled with CUDA 12.0.
+    let cccl_include = match ensure_cccl(&flashinfer_path) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            println!("cargo:warning=Failed to provision CCCL: {}", e);
+            None
+        }
+    };
+
     // Compile CUDA kernels
-    if let Err(e) = compile_cuda_kernels(&cuda_path, &flashinfer_path, cuda_arch) {
+    if let Err(e) = compile_cuda_kernels(&cuda_path, &flashinfer_path, cccl_include.as_deref(), cuda_arch) {
         println!("cargo:warning=Failed to compile CUDA kernels: {}", e);
         println!("cargo:warning=FFI functions will return UNSUPPORTED at runtime.");
         generate_stub_bindings();
@@ -278,6 +295,95 @@ fn download_flashinfer(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Ensure CCCL (libcudacxx) is available and return the path to its `include/` directory.
+///
+/// Search order:
+/// 1. `<flashinfer_path>/3rdparty/cccl/libcudacxx/include` — populated either by `git submodule
+///    update --init` for local clones, or auto-provisioned on first build.
+/// 2. `OUT_DIR/cccl/libcudacxx/include` — standalone clone for sparse-checkout downloads
+///    (where `3rdparty/cccl` is not part of the FlashInfer working tree).
+fn ensure_cccl(flashinfer_path: &Path) -> Result<PathBuf, String> {
+    let in_tree = flashinfer_path.join("3rdparty/cccl/libcudacxx/include");
+    if in_tree.exists() {
+        return Ok(in_tree);
+    }
+
+    // Try `git submodule update --init` if FlashInfer is a git working tree with the submodule
+    // declared. This is the common case for local development checkouts.
+    if flashinfer_path.join(".gitmodules").exists() && flashinfer_path.join(".git").exists() {
+        println!("cargo:warning=Initializing CCCL submodule at {}", flashinfer_path.display());
+        let status = Command::new("git")
+            .args(["submodule", "update", "--init", "--depth", "1", "3rdparty/cccl"])
+            .current_dir(flashinfer_path)
+            .status()
+            .map_err(|e| format!("Failed to run git submodule: {}", e))?;
+        if status.success() && in_tree.exists() {
+            return Ok(in_tree);
+        }
+        println!("cargo:warning=Submodule init failed; falling back to standalone CCCL clone");
+    }
+
+    // Fallback: standalone clone into OUT_DIR. Required for the auto-download flow because
+    // we shallow-clone FlashInfer with sparse-checkout for `include/` only and never pull
+    // submodules.
+    let out_dir = env::var("OUT_DIR").map_err(|_| "OUT_DIR unset".to_string())?;
+    let cccl_root = PathBuf::from(&out_dir).join("cccl");
+    let include = cccl_root.join("libcudacxx/include");
+    if include.exists() {
+        println!("cargo:warning=Using cached CCCL at: {}", cccl_root.display());
+        return Ok(include);
+    }
+
+    println!("cargo:warning=Cloning CCCL {} into {}", &CCCL_COMMIT[..12], cccl_root.display());
+    if cccl_root.exists() {
+        std::fs::remove_dir_all(&cccl_root)
+            .map_err(|e| format!("Failed to clean {}: {}", cccl_root.display(), e))?;
+    }
+    let status = Command::new("git")
+        .args([
+            "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+            CCCL_REPO, cccl_root.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| format!("Failed to run git clone: {}", e))?;
+    if !status.success() {
+        return Err("git clone CCCL failed".to_string());
+    }
+
+    // Only need libcudacxx headers; cub/thrust are not used through FlashInfer headers.
+    let status = Command::new("git")
+        .args(["sparse-checkout", "set", "libcudacxx"])
+        .current_dir(&cccl_root)
+        .status()
+        .map_err(|e| format!("Failed to set sparse-checkout: {}", e))?;
+    if !status.success() {
+        return Err("git sparse-checkout for CCCL failed".to_string());
+    }
+
+    let status = Command::new("git")
+        .args(["fetch", "--depth", "1", "origin", CCCL_COMMIT])
+        .current_dir(&cccl_root)
+        .status()
+        .map_err(|e| format!("Failed to fetch CCCL commit: {}", e))?;
+    if !status.success() {
+        return Err(format!("git fetch CCCL {} failed", &CCCL_COMMIT[..12]));
+    }
+
+    let status = Command::new("git")
+        .args(["checkout", CCCL_COMMIT])
+        .current_dir(&cccl_root)
+        .status()
+        .map_err(|e| format!("Failed to checkout CCCL: {}", e))?;
+    if !status.success() {
+        return Err(format!("git checkout CCCL {} failed", &CCCL_COMMIT[..12]));
+    }
+
+    if !include.exists() {
+        return Err("CCCL clone succeeded but libcudacxx/include is missing".to_string());
+    }
+    Ok(include)
+}
+
 /// Determine target CUDA architecture
 fn determine_cuda_arch() -> u32 {
     // Check environment variable
@@ -307,6 +413,7 @@ fn determine_cuda_arch() -> u32 {
 fn compile_cuda_kernels(
     cuda_path: &Path,
     flashinfer_path: &Path,
+    cccl_include: Option<&Path>,
     cuda_arch: u32,
 ) -> Result<(), String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -339,8 +446,17 @@ fn compile_cuda_kernels(
         .cudart("shared")
         .cpp(true)
         .std("c++17")
-        // Include paths
-        .include(&csrc_path)
+        // Include paths.
+        // CCCL must come before CUDA toolkit's include dir so that the newer
+        // vendored libcudacxx headers (cuda/cmath, cuda/std/limits, ...) are
+        // picked up instead of the older copy bundled with CUDA 12.0.
+        .include(&csrc_path);
+
+    if let Some(cccl) = cccl_include {
+        build.include(cccl);
+    }
+
+    build
         .include(flashinfer_path.join("include"))
         .include(cuda_path.join("include"))
         // Use gcc-12 as host compiler for compatibility with nvcc 12.0

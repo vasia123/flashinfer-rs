@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -950,13 +951,18 @@ FlashInferStatus flashinfer_apply_rope_with_cos_sin_cache(
  *
  * @param probs       Probability tensor [batch_size, vocab_size]
  * @param output      Sampled indices [batch_size]
+ * @param valid_out   Optional per-batch validity flags [batch_size] (NULL to ignore).
+ *                    Each entry is set to `false` when sampling could not produce a
+ *                    valid token (e.g. NaN/degenerate distribution after filtering).
  * @param top_k_arr   Per-batch Top-K values [batch_size] (NULL for uniform top_k_val)
  * @param top_k_val   Default Top-K value (used when top_k_arr is NULL or per-batch)
  * @param batch_size  Batch size
  * @param vocab_size  Vocabulary size
  * @param deterministic Use deterministic sampling
- * @param philox_seed Random seed for Philox RNG
- * @param philox_offset Offset for Philox RNG
+ * @param philox_seed_arr   Optional per-batch seeds [batch_size] (NULL → use philox_seed)
+ * @param philox_seed       Default Philox seed (used when philox_seed_arr is NULL)
+ * @param philox_offset_arr Optional per-batch offsets [batch_size] (NULL → use philox_offset)
+ * @param philox_offset     Default Philox offset (used when philox_offset_arr is NULL)
  * @param dtype       Data type (float16 or bfloat16)
  * @param stream      CUDA stream
  * @return Status code
@@ -964,12 +970,15 @@ FlashInferStatus flashinfer_apply_rope_with_cos_sin_cache(
 FlashInferStatus flashinfer_top_k_sampling(
     const void* probs,
     int32_t* output,
+    bool* valid_out,
     const int32_t* top_k_arr,
     uint32_t top_k_val,
     uint32_t batch_size,
     uint32_t vocab_size,
     int deterministic,
+    const uint64_t* philox_seed_arr,
     uint64_t philox_seed,
+    const uint64_t* philox_offset_arr,
     uint64_t philox_offset,
     FlashInferDType dtype,
     void* stream
@@ -994,12 +1003,15 @@ FlashInferStatus flashinfer_top_k_sampling(
 FlashInferStatus flashinfer_top_p_sampling(
     const void* probs,
     int32_t* output,
+    bool* valid_out,
     const float* top_p_arr,
     float top_p_val,
     uint32_t batch_size,
     uint32_t vocab_size,
     int deterministic,
+    const uint64_t* philox_seed_arr,
     uint64_t philox_seed,
+    const uint64_t* philox_offset_arr,
     uint64_t philox_offset,
     FlashInferDType dtype,
     void* stream
@@ -1024,12 +1036,15 @@ FlashInferStatus flashinfer_top_p_sampling(
 FlashInferStatus flashinfer_min_p_sampling(
     const void* probs,
     int32_t* output,
+    bool* valid_out,
     const float* min_p_arr,
     float min_p_val,
     uint32_t batch_size,
     uint32_t vocab_size,
     int deterministic,
+    const uint64_t* philox_seed_arr,
     uint64_t philox_seed,
+    const uint64_t* philox_offset_arr,
     uint64_t philox_offset,
     FlashInferDType dtype,
     void* stream
@@ -1056,6 +1071,7 @@ FlashInferStatus flashinfer_min_p_sampling(
 FlashInferStatus flashinfer_top_k_top_p_sampling(
     const void* probs,
     int32_t* output,
+    bool* valid_out,
     const int32_t* top_k_arr,
     const float* top_p_arr,
     uint32_t top_k_val,
@@ -1063,7 +1079,9 @@ FlashInferStatus flashinfer_top_k_top_p_sampling(
     uint32_t batch_size,
     uint32_t vocab_size,
     int deterministic,
+    const uint64_t* philox_seed_arr,
     uint64_t philox_seed,
+    const uint64_t* philox_offset_arr,
     uint64_t philox_offset,
     FlashInferDType dtype,
     void* stream
@@ -1138,6 +1156,54 @@ FlashInferStatus flashinfer_top_p_renorm_probs(
     uint32_t vocab_size,
     FlashInferDType dtype,
     void* stream
+);
+
+/**
+ * AIR Top-P renormalization (radix-based, no full sort).
+ *
+ * Faster alternative to flashinfer_top_p_renorm_probs for large vocabularies.
+ * Based on TensorRT-LLM's AIR Top-P (FlashInfer include/flashinfer/air_top_p.cuh).
+ *
+ * Requires a workspace buffer whose size depends on (batch_size, vocab_size).
+ * Query the required size first with flashinfer_air_top_p_renorm_probs_workspace_size.
+ *
+ * @param probs           Probability tensor [batch_size, vocab_size] (float32 only)
+ * @param renormed_probs  Output [batch_size, vocab_size]
+ * @param top_p_arr       Per-batch Top-P thresholds [batch_size] (NULL → uniform top_p_val)
+ * @param top_p_val       Default Top-P value
+ * @param batch_size      Batch size
+ * @param vocab_size      Vocabulary size
+ * @param deterministic   Non-zero → use deterministic histogram accumulation
+ * @param workspace       Device scratch buffer
+ * @param workspace_size  Size of workspace in bytes; must be ≥ required size
+ * @param dtype           Data type (FLOAT32)
+ * @param stream          CUDA stream
+ * @return Status code (returns INVALID_ARGUMENT if workspace_size is too small)
+ */
+FlashInferStatus flashinfer_air_top_p_renorm_probs(
+    const void* probs,
+    void* renormed_probs,
+    const float* top_p_arr,
+    float top_p_val,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    int deterministic,
+    void* workspace,
+    size_t workspace_size,
+    FlashInferDType dtype,
+    void* stream
+);
+
+/**
+ * Query the workspace size (in bytes) required by flashinfer_air_top_p_renorm_probs.
+ *
+ * The returned value is an upper bound that covers both the deterministic and
+ * non-deterministic variants, so callers can pick `deterministic` at run time.
+ */
+FlashInferStatus flashinfer_air_top_p_renorm_probs_workspace_size(
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    size_t* workspace_size_out
 );
 
 /* ============================================================================

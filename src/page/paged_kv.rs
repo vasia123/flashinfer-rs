@@ -146,6 +146,12 @@ impl PagedKVMetadata {
     }
 
     /// Validate metadata consistency.
+    ///
+    /// Note: FlashInfer's MLA kernel widens page indices to `int64_t` before
+    /// the `* stride_page` multiply (upstream PR #3136), so the total cache
+    /// footprint may exceed 2^31 bytes. The page *count* itself is still
+    /// limited to `i32::MAX` because `indices`/`indptr` are still `int32_t`
+    /// arrays at the FFI boundary.
     pub fn validate(&self) -> Result<()> {
         // Check indptr is monotonically increasing
         for i in 0..self.indptr.len() - 1 {
@@ -163,6 +169,15 @@ impl PagedKVMetadata {
                 "indices length {} doesn't match expected {}",
                 self.indices.len(),
                 expected_pages
+            )));
+        }
+
+        // FFI passes indices/indptr as int32_t arrays — explicit check so the
+        // caller gets a clear error rather than a silent overflow at the C++ boundary.
+        if self.indices.len() > i32::MAX as usize {
+            return Err(crate::FlashInferError::invalid_config(format!(
+                "total page count {} exceeds i32::MAX; FlashInfer indices are int32_t",
+                self.indices.len()
             )));
         }
 

@@ -806,24 +806,30 @@ pub unsafe fn apply_rope_with_cos_sin_cache(
 pub unsafe fn top_k_sampling(
     probs: *const f32,
     output: *mut i32,
-    top_k_arr: *const i32, // NULL for uniform top_k_val
+    valid_out: *mut bool,            // null if not requested
+    top_k_arr: *const i32,           // null for uniform top_k_val
     top_k_val: u32,
     batch_size: u32,
     vocab_size: u32,
     deterministic: bool,
+    philox_seed_arr: *const u64,     // null → use philox_seed
     philox_seed: u64,
+    philox_offset_arr: *const u64,   // null → use philox_offset
     philox_offset: u64,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let status = flashinfer_top_k_sampling(
         probs as *const std::ffi::c_void,
         output,
+        valid_out,
         top_k_arr,
         top_k_val,
         batch_size,
         vocab_size,
         if deterministic { 1 } else { 0 },
+        philox_seed_arr,
         philox_seed,
+        philox_offset_arr,
         philox_offset,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
         stream,
@@ -841,24 +847,30 @@ pub unsafe fn top_k_sampling(
 pub unsafe fn top_p_sampling(
     probs: *const f32,
     output: *mut i32,
-    top_p_arr: *const f32, // NULL for uniform top_p_val
+    valid_out: *mut bool,
+    top_p_arr: *const f32,
     top_p_val: f32,
     batch_size: u32,
     vocab_size: u32,
     deterministic: bool,
+    philox_seed_arr: *const u64,
     philox_seed: u64,
+    philox_offset_arr: *const u64,
     philox_offset: u64,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let status = flashinfer_top_p_sampling(
         probs as *const std::ffi::c_void,
         output,
+        valid_out,
         top_p_arr,
         top_p_val,
         batch_size,
         vocab_size,
         if deterministic { 1 } else { 0 },
+        philox_seed_arr,
         philox_seed,
+        philox_offset_arr,
         philox_offset,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
         stream,
@@ -876,24 +888,30 @@ pub unsafe fn top_p_sampling(
 pub unsafe fn min_p_sampling(
     probs: *const f32,
     output: *mut i32,
-    min_p_arr: *const f32, // NULL for uniform min_p_val
+    valid_out: *mut bool,
+    min_p_arr: *const f32,
     min_p_val: f32,
     batch_size: u32,
     vocab_size: u32,
     deterministic: bool,
+    philox_seed_arr: *const u64,
     philox_seed: u64,
+    philox_offset_arr: *const u64,
     philox_offset: u64,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let status = flashinfer_min_p_sampling(
         probs as *const std::ffi::c_void,
         output,
+        valid_out,
         min_p_arr,
         min_p_val,
         batch_size,
         vocab_size,
         if deterministic { 1 } else { 0 },
+        philox_seed_arr,
         philox_seed,
+        philox_offset_arr,
         philox_offset,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
         stream,
@@ -911,20 +929,24 @@ pub unsafe fn min_p_sampling(
 pub unsafe fn top_k_top_p_sampling(
     probs: *const f32,
     output: *mut i32,
-    top_k_arr: *const i32, // NULL for uniform top_k_val
-    top_p_arr: *const f32, // NULL for uniform top_p_val
+    valid_out: *mut bool,
+    top_k_arr: *const i32,
+    top_p_arr: *const f32,
     top_k_val: u32,
     top_p_val: f32,
     batch_size: u32,
     vocab_size: u32,
     deterministic: bool,
+    philox_seed_arr: *const u64,
     philox_seed: u64,
+    philox_offset_arr: *const u64,
     philox_offset: u64,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let status = flashinfer_top_k_top_p_sampling(
         probs as *const std::ffi::c_void,
         output,
+        valid_out,
         top_k_arr,
         top_p_arr,
         top_k_val,
@@ -932,7 +954,9 @@ pub unsafe fn top_k_top_p_sampling(
         batch_size,
         vocab_size,
         if deterministic { 1 } else { 0 },
+        philox_seed_arr,
         philox_seed,
+        philox_offset_arr,
         philox_offset,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
         stream,
@@ -992,6 +1016,59 @@ pub unsafe fn top_p_renorm_probs(
         top_p_val,
         batch_size,
         vocab_size,
+        FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
+        stream,
+    );
+    check_status(status)
+}
+
+/// Required workspace size (in bytes) for [`air_top_p_renorm_probs`].
+///
+/// Returns an upper bound that covers both the deterministic and
+/// non-deterministic variants.
+pub fn air_top_p_renorm_probs_workspace_size(
+    batch_size: u32,
+    vocab_size: u32,
+) -> Result<usize> {
+    let mut size: usize = 0;
+    let status = unsafe {
+        flashinfer_air_top_p_renorm_probs_workspace_size(batch_size, vocab_size, &mut size)
+    };
+    check_status(status)?;
+    Ok(size)
+}
+
+/// AIR Top-P renormalization (radix-based, no full sort).
+///
+/// Faster alternative to [`top_p_renorm_probs`] for large vocabularies.
+/// Requires a device workspace buffer; query the required size via
+/// [`air_top_p_renorm_probs_workspace_size`].
+///
+/// # Safety
+/// All pointers must be valid and point to device memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn air_top_p_renorm_probs(
+    probs: *const f32,
+    renormed_probs: *mut f32,
+    top_p_arr: *const f32,
+    top_p_val: f32,
+    batch_size: u32,
+    vocab_size: u32,
+    deterministic: bool,
+    workspace: *mut std::ffi::c_void,
+    workspace_size: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let status = flashinfer_air_top_p_renorm_probs(
+        probs as *const std::ffi::c_void,
+        renormed_probs as *mut std::ffi::c_void,
+        top_p_arr,
+        top_p_val,
+        batch_size,
+        vocab_size,
+        if deterministic { 1 } else { 0 },
+        workspace,
+        workspace_size,
         FlashInferDType::FLASHINFER_DTYPE_FLOAT32,
         stream,
     );
@@ -1169,6 +1246,10 @@ unsafe impl Send for MLAPlan {}
 /// - ckv_cache: compressed KV (dimension 512 for DeepSeek)
 /// - kpe_cache: K position embedding (dimension 64 for DeepSeek)
 ///
+/// Supported `dtype` values: `Float16`, `BFloat16`, `Float8E4M3`, `Float8E5M2`.
+/// FP8 paths perform a byte-level copy and assume the caller has pre-quantized
+/// the source tensors; no conversion is performed inside the kernel.
+///
 /// # Safety
 /// All pointers must be valid and point to device memory.
 #[allow(clippy::too_many_arguments)]
@@ -1213,6 +1294,9 @@ pub unsafe fn append_paged_mla_kv_cache(
 /// k_nope: [num_tokens, num_heads=128, nope_dim=128]
 /// k_rope: [num_tokens, 1, rope_dim=64] (broadcast to all heads)
 /// k:      [num_tokens, num_heads=128, k_head_dim=192]
+///
+/// Supported `dtype` values: `Float16`, `BFloat16`, `Float8E4M3`, `Float8E5M2`
+/// (FP8 dispatch added upstream by PR #3129).
 ///
 /// # Safety
 /// All pointers must be valid and point to device memory.

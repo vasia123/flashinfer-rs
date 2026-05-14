@@ -12,6 +12,7 @@
 
 #include "flashinfer_common.h"
 
+#include <cuda_fp8.h>
 #include <flashinfer/page.cuh>
 #include <flashinfer/concat_mla.cuh>
 #include <flashinfer/attention/mla.cuh>
@@ -116,8 +117,14 @@ FlashInferStatus flashinfer_append_paged_mla_kv_cache(
         DISPATCH_APPEND_MLA(__half);
     } else if (dtype == FLASHINFER_DTYPE_BFLOAT16) {
         DISPATCH_APPEND_MLA(__nv_bfloat16);
+    } else if (dtype == FLASHINFER_DTYPE_FLOAT8_E4M3) {
+        // FP8 append is a byte-level copy into the paged cache. Caller is
+        // responsible for pre-quantizing the input tensors to FP8.
+        DISPATCH_APPEND_MLA(__nv_fp8_e4m3);
+    } else if (dtype == FLASHINFER_DTYPE_FLOAT8_E5M2) {
+        DISPATCH_APPEND_MLA(__nv_fp8_e5m2);
     } else {
-        set_error("append_paged_mla_kv_cache only supports float16 and bfloat16");
+        set_error("append_paged_mla_kv_cache only supports float16, bfloat16, fp8_e4m3, fp8_e5m2");
         return FLASHINFER_UNSUPPORTED;
     }
 
@@ -153,36 +160,36 @@ FlashInferStatus flashinfer_concat_mla_k(
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     cudaError_t err;
 
+    // ConcatMLAK has compile-time dispatch over FP16 / BF16 / FP8 (E4M3, E5M2)
+    // since FlashInfer #3129 — see include/flashinfer/concat_mla.cuh ConcatMLAVecTraits.
+    #define DISPATCH_CONCAT_MLA(DType)                                         \
+        err = flashinfer::ConcatMLAK<DType>(                                   \
+            static_cast<DType*>(k),                                            \
+            static_cast<const DType*>(k_nope),                                 \
+            static_cast<const DType*>(k_rope),                                 \
+            num_tokens,                                                        \
+            k_stride_n,                                                        \
+            k_stride_h,                                                        \
+            k_nope_stride_n,                                                   \
+            k_nope_stride_h,                                                   \
+            k_rope_stride_n,                                                   \
+            cuda_stream                                                        \
+        )
+
     if (dtype == FLASHINFER_DTYPE_FLOAT16) {
-        err = flashinfer::ConcatMLAK<__half>(
-            static_cast<__half*>(k),
-            static_cast<const __half*>(k_nope),
-            static_cast<const __half*>(k_rope),
-            num_tokens,
-            k_stride_n,
-            k_stride_h,
-            k_nope_stride_n,
-            k_nope_stride_h,
-            k_rope_stride_n,
-            cuda_stream
-        );
+        DISPATCH_CONCAT_MLA(__half);
     } else if (dtype == FLASHINFER_DTYPE_BFLOAT16) {
-        err = flashinfer::ConcatMLAK<__nv_bfloat16>(
-            static_cast<__nv_bfloat16*>(k),
-            static_cast<const __nv_bfloat16*>(k_nope),
-            static_cast<const __nv_bfloat16*>(k_rope),
-            num_tokens,
-            k_stride_n,
-            k_stride_h,
-            k_nope_stride_n,
-            k_nope_stride_h,
-            k_rope_stride_n,
-            cuda_stream
-        );
+        DISPATCH_CONCAT_MLA(__nv_bfloat16);
+    } else if (dtype == FLASHINFER_DTYPE_FLOAT8_E4M3) {
+        DISPATCH_CONCAT_MLA(__nv_fp8_e4m3);
+    } else if (dtype == FLASHINFER_DTYPE_FLOAT8_E5M2) {
+        DISPATCH_CONCAT_MLA(__nv_fp8_e5m2);
     } else {
-        set_error("concat_mla_k only supports float16 and bfloat16");
+        set_error("concat_mla_k only supports float16, bfloat16, fp8_e4m3, fp8_e5m2");
         return FLASHINFER_UNSUPPORTED;
     }
+
+    #undef DISPATCH_CONCAT_MLA
 
     return from_cuda_error(err);
 }

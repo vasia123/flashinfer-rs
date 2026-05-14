@@ -47,10 +47,12 @@ use crate::Result;
 /// )?;
 /// ```
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn top_k_sampling(
     probs: &CudaSlice<f32>,
     output: &mut CudaSlice<i32>,
     top_k: Option<&CudaSlice<i32>>,
+    valid_out: Option<&mut CudaSlice<bool>>,
     batch_size: u32,
     vocab_size: u32,
     config: &SamplingConfig,
@@ -63,6 +65,13 @@ pub fn top_k_sampling(
         })
         .unwrap_or(std::ptr::null());
 
+    let valid_ptr = valid_out
+        .map(|v| {
+            let (ptr, _guard) = v.device_ptr_mut(stream);
+            ptr as *mut bool
+        })
+        .unwrap_or(std::ptr::null_mut());
+
     let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
     let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
     let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
@@ -71,12 +80,15 @@ pub fn top_k_sampling(
         crate::ffi::top_k_sampling(
             probs_ptr as *const f32,
             output_ptr as *mut i32,
+            valid_ptr,
             top_k_arr,
             config.top_k,
             batch_size,
             vocab_size,
             config.deterministic,
+            std::ptr::null(),
             config.seed,
+            std::ptr::null(),
             config.offset,
             cu_stream,
         )
@@ -99,10 +111,12 @@ pub fn top_k_sampling(
 /// * `config` - Sampling configuration (includes RNG seed, top_p default)
 /// * `stream` - CUDA stream
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn top_p_sampling(
     probs: &CudaSlice<f32>,
     output: &mut CudaSlice<i32>,
     top_p: Option<&CudaSlice<f32>>,
+    valid_out: Option<&mut CudaSlice<bool>>,
     batch_size: u32,
     vocab_size: u32,
     config: &SamplingConfig,
@@ -115,6 +129,13 @@ pub fn top_p_sampling(
         })
         .unwrap_or(std::ptr::null());
 
+    let valid_ptr = valid_out
+        .map(|v| {
+            let (ptr, _guard) = v.device_ptr_mut(stream);
+            ptr as *mut bool
+        })
+        .unwrap_or(std::ptr::null_mut());
+
     let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
     let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
     let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
@@ -123,12 +144,15 @@ pub fn top_p_sampling(
         crate::ffi::top_p_sampling(
             probs_ptr as *const f32,
             output_ptr as *mut i32,
+            valid_ptr,
             top_p_arr,
             config.top_p,
             batch_size,
             vocab_size,
             config.deterministic,
+            std::ptr::null(),
             config.seed,
+            std::ptr::null(),
             config.offset,
             cu_stream,
         )
@@ -150,10 +174,12 @@ pub fn top_p_sampling(
 /// * `config` - Sampling configuration (includes RNG seed, min_p default)
 /// * `stream` - CUDA stream
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn min_p_sampling(
     probs: &CudaSlice<f32>,
     output: &mut CudaSlice<i32>,
     min_p: Option<&CudaSlice<f32>>,
+    valid_out: Option<&mut CudaSlice<bool>>,
     batch_size: u32,
     vocab_size: u32,
     config: &SamplingConfig,
@@ -166,6 +192,13 @@ pub fn min_p_sampling(
         })
         .unwrap_or(std::ptr::null());
 
+    let valid_ptr = valid_out
+        .map(|v| {
+            let (ptr, _guard) = v.device_ptr_mut(stream);
+            ptr as *mut bool
+        })
+        .unwrap_or(std::ptr::null_mut());
+
     let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
     let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
     let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
@@ -174,12 +207,15 @@ pub fn min_p_sampling(
         crate::ffi::min_p_sampling(
             probs_ptr as *const f32,
             output_ptr as *mut i32,
+            valid_ptr,
             min_p_arr,
             config.min_p,
             batch_size,
             vocab_size,
             config.deterministic,
+            std::ptr::null(),
             config.seed,
+            std::ptr::null(),
             config.offset,
             cu_stream,
         )
@@ -209,6 +245,7 @@ pub fn top_k_top_p_sampling(
     output: &mut CudaSlice<i32>,
     top_k: Option<&CudaSlice<i32>>,
     top_p: Option<&CudaSlice<f32>>,
+    valid_out: Option<&mut CudaSlice<bool>>,
     batch_size: u32,
     vocab_size: u32,
     config: &SamplingConfig,
@@ -227,6 +264,13 @@ pub fn top_k_top_p_sampling(
         })
         .unwrap_or(std::ptr::null());
 
+    let valid_ptr = valid_out
+        .map(|v| {
+            let (ptr, _guard) = v.device_ptr_mut(stream);
+            ptr as *mut bool
+        })
+        .unwrap_or(std::ptr::null_mut());
+
     let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
     let (output_ptr, _output_guard) = output.device_ptr_mut(stream);
     let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
@@ -235,6 +279,7 @@ pub fn top_k_top_p_sampling(
         crate::ffi::top_k_top_p_sampling(
             probs_ptr as *const f32,
             output_ptr as *mut i32,
+            valid_ptr,
             top_k_arr,
             top_p_arr,
             config.top_k,
@@ -242,7 +287,9 @@ pub fn top_k_top_p_sampling(
             batch_size,
             vocab_size,
             config.deterministic,
+            std::ptr::null(),
             config.seed,
+            std::ptr::null(),
             config.offset,
             cu_stream,
         )
@@ -349,6 +396,75 @@ pub fn top_p_renorm_probs(
             config.top_p,
             batch_size,
             vocab_size,
+            cu_stream,
+        )
+    }
+}
+
+/// AIR Top-P renormalization (radix-based, no full sort).
+///
+/// Faster alternative to [`top_p_renorm_probs`] for large vocabularies.
+/// Uses TensorRT-LLM-style multi-pass radix bucketing.
+///
+/// Required workspace size can be obtained via
+/// [`crate::ffi::air_top_p_renorm_probs_workspace_size`]. The workspace must
+/// be allocated on device and live at least as long as this call.
+///
+/// # Arguments
+///
+/// * `probs` - Input probabilities `[batch_size, vocab_size]` (float32 only)
+/// * `renormed_probs` - Output `[batch_size, vocab_size]`
+/// * `top_p` - Optional per-batch Top-P values, None uses `config.top_p`
+/// * `workspace` - Device scratch buffer (see workspace_size helper)
+/// * `batch_size` - Batch size
+/// * `vocab_size` - Vocabulary size
+/// * `config` - Sampling configuration (uses `top_p`, `deterministic`)
+/// * `stream` - CUDA stream
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn air_top_p_renorm_probs(
+    probs: &CudaSlice<f32>,
+    renormed_probs: &mut CudaSlice<f32>,
+    top_p: Option<&CudaSlice<f32>>,
+    workspace: &mut CudaSlice<u8>,
+    batch_size: u32,
+    vocab_size: u32,
+    config: &SamplingConfig,
+    stream: &CudaStream,
+) -> Result<()> {
+    let required = crate::ffi::air_top_p_renorm_probs_workspace_size(batch_size, vocab_size)?;
+    if workspace.len() < required {
+        return Err(crate::FlashInferError::invalid_config(format!(
+            "air_top_p_renorm_probs workspace too small: need {} bytes, got {}",
+            required,
+            workspace.len()
+        )));
+    }
+
+    let top_p_arr = top_p
+        .map(|t| {
+            let (ptr, _guard) = t.device_ptr(stream);
+            ptr as *const f32
+        })
+        .unwrap_or(std::ptr::null());
+
+    let ws_len = workspace.len();
+    let (probs_ptr, _probs_guard) = probs.device_ptr(stream);
+    let (renormed_ptr, _renormed_guard) = renormed_probs.device_ptr_mut(stream);
+    let (ws_ptr, _ws_guard) = workspace.device_ptr_mut(stream);
+    let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
+
+    unsafe {
+        crate::ffi::air_top_p_renorm_probs(
+            probs_ptr as *const f32,
+            renormed_ptr as *mut f32,
+            top_p_arr,
+            config.top_p,
+            batch_size,
+            vocab_size,
+            config.deterministic,
+            ws_ptr as *mut std::ffi::c_void,
+            ws_len,
             cu_stream,
         )
     }

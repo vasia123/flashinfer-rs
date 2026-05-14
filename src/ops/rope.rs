@@ -507,6 +507,23 @@ fn to_ffi_rope_quant_config<T: GpuFloat>(
 /// Fused RoPE + Quantize + Append to paged KV cache.
 ///
 /// **Requires SM89+ (Ada Lovelace, Hopper)**
+///
+/// # Padding tokens
+///
+/// As of upstream FlashInfer PR #2792, entries with `batch_indices[i] < 0`
+/// are silently skipped — RoPE/quant/append is a no-op for those rows.
+/// This lets callers run a single fused kernel over a fixed-size buffer that
+/// mixes real tokens with padding (e.g. jagged batches packed to a max length)
+/// without having to slice or compact ahead of time.
+///
+/// # Example: jagged batch with padding
+///
+/// ```ignore
+/// // 3 sequences of length [2, 1, 3], padded to length 4 each
+/// // batch_indices: [0, 0, -1, -1,  1, -1, -1, -1,  2, 2, 2, -1]
+/// // positions:     [0, 1,  0,  0,  0,  0,  0,  0,  0, 1, 2,  0]
+/// // → kernel writes 6 real tokens, skips the 6 padding rows.
+/// ```
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn rope_quant_append_paged_kv_cache<T: GpuFloat>(
