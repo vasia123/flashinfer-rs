@@ -5,11 +5,45 @@
 //! sequence has exactly one new query token.
 
 use crate::page_table::PageTable;
-use crate::types::GpuFloat;
+use crate::types::{DType, GpuFloat};
 use crate::workspace::Workspace;
 use crate::{ffi, AttentionConfig, FlashInferError, KVLayout, Result};
 use cudarc::driver::{CudaStream, CudaSlice, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
+
+/// Per-tensor scales for FP8 batch decode.
+///
+/// Used by [`BatchDecodeHandler::forward_fp8`]. Each scale dequantizes the
+/// corresponding FP8 byte tensor: `real = fp8_value_as_float * scale`. Use
+/// `1.0` for any tensor that is not FP8 (e.g. `q = 1.0` when Q is FP16/BF16).
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8DecodeScales {
+    /// Q dequant scale (use 1.0 if Q is FP16/BF16).
+    pub q: f32,
+    /// K dequant scale.
+    pub k: f32,
+    /// V dequant scale (applied to output post-launch).
+    pub v: f32,
+}
+
+impl Default for Fp8DecodeScales {
+    fn default() -> Self {
+        Self { q: 1.0, k: 1.0, v: 1.0 }
+    }
+}
+
+impl Fp8DecodeScales {
+    /// Identity scales — useful for sanity-testing the FP8 path without
+    /// actually dequantizing.
+    pub fn identity() -> Self {
+        Self::default()
+    }
+
+    /// All three scales equal.
+    pub fn uniform(scale: f32) -> Self {
+        Self { q: scale, k: scale, v: scale }
+    }
+}
 
 /// Handler for batched decode attention with paged KV cache.
 ///
@@ -261,6 +295,168 @@ impl BatchDecodeHandler {
                 last_page_ptr as *const i32,
                 out_ptr as *mut std::ffi::c_void,
                 lse_ptr as *mut f32,
+                plan_data.kv_layout.into(),
+                stream.cu_stream() as *mut std::ffi::c_void,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Run batch decode against an FP8-quantized paged KV cache.
+    ///
+    /// Mirrors [`Self::forward`] but takes raw FP8 byte buffers for the KV
+    /// cache (`CudaSlice<u8>`) and per-tensor `scales` (see
+    /// [`Fp8DecodeScales`]). Q may be FP16/BF16 (`T_q: GpuFloat`) or — for
+    /// fully-quantized pipelines — also FP8: in that case pass an FP8 byte
+    /// buffer wrapped in a `CudaSlice<u8>` via [`Self::forward_fp8_raw`].
+    ///
+    /// The output dtype equals `T_q` (the kernel keeps Q's precision for
+    /// the output). `kv_dtype` selects the FP8 representation of the cache
+    /// (E4M3 vs E5M2).
+    ///
+    /// `lse` is optional. When provided together with
+    /// `correct_lse_for_v_scale = true`, LSE is shifted by `log(v_scale)`
+    /// post-launch (useful when LSE composes into a fused merge).
+    #[allow(clippy::too_many_arguments)]
+    #[allow(non_camel_case_types)]
+    pub fn forward_fp8<T_q: GpuFloat>(
+        &self,
+        query: &CudaSlice<T_q>,
+        kv_cache_k: &CudaSlice<u8>,
+        kv_cache_v: &CudaSlice<u8>,
+        output: &mut CudaSlice<T_q>,
+        lse: Option<&mut CudaSlice<f32>>,
+        scales: Fp8DecodeScales,
+        kv_dtype: DType,
+        correct_lse_for_v_scale: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if kv_dtype != DType::Float8E4M3 && kv_dtype != DType::Float8E5M2 {
+            return Err(FlashInferError::invalid_config(
+                "forward_fp8: kv_dtype must be Float8E4M3 or Float8E5M2",
+            ));
+        }
+        if !scales.q.is_finite() || !scales.k.is_finite() || !scales.v.is_finite() {
+            return Err(FlashInferError::invalid_config(
+                "forward_fp8: scales must be finite",
+            ));
+        }
+
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward_fp8()"))?;
+
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (indptr_ptr, _indptr_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+        let lse_ptr = if let Some(lse) = lse {
+            let (ptr, _lse_guard) = lse.device_ptr_mut(stream);
+            ptr as *mut f32
+        } else {
+            std::ptr::null_mut()
+        };
+
+        unsafe {
+            plan_data.plan.run_fp8(
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
+                lse_ptr,
+                scales.q,
+                scales.k,
+                scales.v,
+                correct_lse_for_v_scale,
+                T_q::DTYPE.into(),
+                kv_dtype.into(),
+                plan_data.kv_layout.into(),
+                stream.cu_stream() as *mut std::ffi::c_void,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Run batch decode against an FP8-quantized paged KV cache with an FP8
+    /// query tensor (fully-quantized pipeline). The output is BF16
+    /// regardless of `kv_dtype` (FP8 output is not supported on this path —
+    /// re-quantize the BF16 output if needed).
+    ///
+    /// Use [`Self::forward_fp8`] instead when Q is FP16/BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fp8_raw(
+        &self,
+        query: &CudaSlice<u8>,
+        q_dtype: DType,
+        kv_cache_k: &CudaSlice<u8>,
+        kv_cache_v: &CudaSlice<u8>,
+        output: &mut CudaSlice<u16>, // BF16 stored as u16
+        lse: Option<&mut CudaSlice<f32>>,
+        scales: Fp8DecodeScales,
+        kv_dtype: DType,
+        correct_lse_for_v_scale: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if q_dtype != DType::Float8E4M3 && q_dtype != DType::Float8E5M2 {
+            return Err(FlashInferError::invalid_config(
+                "forward_fp8_raw: q_dtype must be Float8E4M3 or Float8E5M2 (use forward_fp8 for FP16/BF16 Q)",
+            ));
+        }
+        if kv_dtype != DType::Float8E4M3 && kv_dtype != DType::Float8E5M2 {
+            return Err(FlashInferError::invalid_config(
+                "forward_fp8_raw: kv_dtype must be Float8E4M3 or Float8E5M2",
+            ));
+        }
+        if !scales.q.is_finite() || !scales.k.is_finite() || !scales.v.is_finite() {
+            return Err(FlashInferError::invalid_config(
+                "forward_fp8_raw: scales must be finite",
+            ));
+        }
+
+        let plan_data = self
+            .plan_data
+            .as_ref()
+            .ok_or_else(|| FlashInferError::invalid_config("must call plan() before forward_fp8_raw()"))?;
+
+        let (q_ptr, _q_guard) = query.device_ptr(stream);
+        let (kk_ptr, _kk_guard) = kv_cache_k.device_ptr(stream);
+        let (kv_ptr, _kv_guard) = kv_cache_v.device_ptr(stream);
+        let (indptr_ptr, _indptr_guard) = plan_data.kv_indptr_d.device_ptr(stream);
+        let (indices_ptr, _indices_guard) = plan_data.kv_indices_d.device_ptr(stream);
+        let (last_page_ptr, _lp_guard) = plan_data.kv_last_page_len_d.device_ptr(stream);
+        let (out_ptr, _out_guard) = output.device_ptr_mut(stream);
+        let lse_ptr = if let Some(lse) = lse {
+            let (ptr, _lse_guard) = lse.device_ptr_mut(stream);
+            ptr as *mut f32
+        } else {
+            std::ptr::null_mut()
+        };
+
+        unsafe {
+            plan_data.plan.run_fp8(
+                q_ptr as *const std::ffi::c_void,
+                kk_ptr as *const std::ffi::c_void,
+                kv_ptr as *const std::ffi::c_void,
+                indptr_ptr as *const i32,
+                indices_ptr as *const i32,
+                last_page_ptr as *const i32,
+                out_ptr as *mut std::ffi::c_void,
+                lse_ptr,
+                scales.q,
+                scales.k,
+                scales.v,
+                correct_lse_for_v_scale,
+                q_dtype.into(),
+                kv_dtype.into(),
                 plan_data.kv_layout.into(),
                 stream.cu_stream() as *mut std::ffi::c_void,
             )?;

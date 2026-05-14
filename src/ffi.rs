@@ -439,22 +439,29 @@ impl BatchDecodePlan {
 
     /// Execute batch decode against an FP8 (E4M3 / E5M2) paged KV cache.
     ///
-    /// Compared to [`Self::run`] the `k_cache` / `v_cache` buffers are
-    /// expected to be packed U8 bytes holding `__nv_fp8_e4m3` or
-    /// `__nv_fp8_e5m2` values, and per-tensor F32 scales are applied
-    /// kernel-side: `k_dequant = k_byte * k_scale`, similarly for V.
+    /// Upstream `BatchDecodeWithPagedKVCacheDispatched` is dtype-templated but
+    /// not scale-aware. This wrapper lifts scaling to the FFI boundary:
     ///
-    /// `q_scale` scales the Q tensor before the QK^T matmul. For Q
-    /// kept in F16/BF16 (the common case in vllm-rust today) pass
-    /// `1.0` — the kernel still walks the FP8 K/V path, which is all
-    /// we need.
+    ///  - `sm_scale` is internally adjusted to `plan.sm_scale * q_scale *
+    ///    k_scale`, so softmax sees `Q_real @ K_real^T * sm_scale_base`. Pass
+    ///    `q_scale = 1.0` if Q is FP16/BF16.
+    ///  - The output is multiplied by `v_scale` post-launch (attention is
+    ///    linear in V). Pass `v_scale = 1.0` to skip the post-scale kernel.
+    ///  - If `correct_lse_for_v_scale = true` and `lse != null`, LSE is
+    ///    shifted by `log(v_scale)` so it reflects post-scaled magnitudes.
+    ///    Useful when LSE composes into a fused merge.
+    ///
+    /// Supported `(q_dtype, kv_dtype)` pairs (8 combinations):
+    /// `Q ∈ {FP16, BF16, FP8_E4M3, FP8_E5M2} × KV ∈ {FP8_E4M3, FP8_E5M2}`.
+    /// `DTypeO = DTypeQ` for FP16/BF16-Q paths; FP8-Q paths fall back to
+    /// BF16 output.
     ///
     /// # Safety
-    /// All pointers must point to valid GPU memory with the layouts
-    /// described in `Self::run`. Scale values must be finite and
-    /// non-NaN. The plan must have been built with the same
-    /// (num_qo_heads, num_kv_heads, head_dim, page_size) tuple as the
-    /// cache buffers.
+    /// All pointers must point to valid GPU memory. Scale values must be
+    /// finite (caller is also encouraged to keep them positive — only
+    /// positive `v_scale` is sensible for `correct_lse_for_v_scale=true`).
+    /// The plan must have been built with the same (head_dim, num_qo_heads,
+    /// num_kv_heads, page_size) tuple as the cache buffers.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn run_fp8(
         &self,
@@ -469,6 +476,9 @@ impl BatchDecodePlan {
         q_scale: f32,
         k_scale: f32,
         v_scale: f32,
+        correct_lse_for_v_scale: bool,
+        q_dtype: DType,
+        kv_dtype: DType,
         kv_layout: KVLayout,
         stream: *mut std::ffi::c_void,
     ) -> Result<()> {
@@ -485,6 +495,9 @@ impl BatchDecodePlan {
             q_scale,
             k_scale,
             v_scale,
+            if correct_lse_for_v_scale { 1 } else { 0 },
+            q_dtype.into(),
+            kv_dtype.into(),
             kv_layout.into(),
             stream,
         );

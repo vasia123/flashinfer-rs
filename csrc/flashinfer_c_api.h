@@ -272,7 +272,51 @@ FlashInferStatus flashinfer_batch_decode_run(
 );
 
 /**
- * Execute batch decode with FP8 scaling.
+ * Batch decode against an FP8-quantized paged KV cache (and optionally FP8 Q).
+ *
+ * Upstream `BatchDecodeWithPagedKVCacheDispatched` is template-based but not
+ * scale-aware (`BatchDecodeParams` only has `sm_scale`). This wrapper lifts
+ * per-tensor scaling to the FFI boundary:
+ *
+ *  - sm_scale is internally adjusted to `plan.sm_scale * q_scale * k_scale`,
+ *    so softmax sees `Q_real @ K_real^T * sm_scale_base`. Pass `q_scale=1.0`
+ *    if Q is FP16/BF16; pass `k_scale=1.0` if KV is non-quantized (rare on
+ *    this path — typically FP8 KV).
+ *  - The output is multiplied by `v_scale` post-launch (attention is linear
+ *    in V, so `out_real = Σ w_i * V_bits * v_scale`). Pass `v_scale=1.0` to
+ *    skip the post-scale kernel.
+ *  - If `correct_lse_for_v_scale != 0` and `lse != NULL`, LSE is shifted by
+ *    `log(v_scale)` so it reflects the real (post-scaled) attention output.
+ *    Useful when LSE is composed into a fused merge across partitions.
+ *
+ * Supported `(q_dtype, kv_dtype)` pairs (8 combinations):
+ *  - Q in {FP16, BF16}: `DTypeO = DTypeQ`
+ *  - Q in {FP8_E4M3, FP8_E5M2}: `DTypeO = BF16` (FP8 output is not
+ *    supported on this path — re-quantize the BF16 output if needed)
+ *  - `kv_dtype` must be FLOAT8_E4M3 or FLOAT8_E5M2
+ *
+ * Supported `head_dim`: 64, 128, 256 (same as the FP16/BF16 path).
+ *
+ * @param plan_handle  Plan built with the matching (head_dim, num_qo_heads,
+ *                     num_kv_heads, page_size). `plan.sm_scale` is the base
+ *                     1/sqrt(head_dim).
+ * @param q            Query [nnz, num_qo_heads, head_dim] in `q_dtype`
+ * @param k_cache      Paged K cache (raw FP8 bytes, `kv_dtype` interpretation)
+ * @param v_cache      Paged V cache (raw FP8 bytes, `kv_dtype` interpretation)
+ * @param kv_indptr    Page offsets [batch_size + 1] (int32)
+ * @param kv_indices   Page indices (int32)
+ * @param kv_last_page_len  Tokens in last page [batch_size] (int32)
+ * @param output       Output [nnz, num_qo_heads, head_dim] in DTypeO
+ * @param lse          Optional log-sum-exp [nnz, num_qo_heads] (NULL OK)
+ * @param q_scale      Q dequant scale (1.0 if Q is FP16/BF16)
+ * @param k_scale      K dequant scale
+ * @param v_scale      V dequant scale (applied to output post-launch)
+ * @param correct_lse_for_v_scale  Non-zero → shift LSE by log(v_scale)
+ * @param q_dtype      Query data type
+ * @param kv_dtype     KV cache data type (FLOAT8_E4M3 or FLOAT8_E5M2)
+ * @param kv_layout    NHD or HND
+ * @param stream       CUDA stream
+ * @return Status code
  */
 FlashInferStatus flashinfer_batch_decode_run_fp8(
     FlashInferBatchDecodePlanHandle plan_handle,
@@ -287,6 +331,9 @@ FlashInferStatus flashinfer_batch_decode_run_fp8(
     float q_scale,
     float k_scale,
     float v_scale,
+    int correct_lse_for_v_scale,
+    FlashInferDType q_dtype,
+    FlashInferDType kv_dtype,
     FlashInferKVLayout kv_layout,
     void* stream
 );
